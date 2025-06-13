@@ -74,7 +74,7 @@ class Account {
               email,
               password,
               token,
-              expires: decoded.exp
+              expiresAt: decoded.exp // 统一字段名为 expiresAt
             })
           }
         })
@@ -156,7 +156,7 @@ class Account {
           this.accountTokens[index] = {
             ...token,
             token: newToken,
-            expires: decoded.exp,
+            expiresAt: decoded.exp, // 统一字段名为 expiresAt
           }
           console.log(`刷新令牌成功: ${token.email} (还有${Math.round((decoded.exp - now) / 3600)}小时过期)`)
           return true
