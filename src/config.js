@@ -10,7 +10,7 @@ const config = {
   searchInfoMode: process.env.SEARCH_INFO_MODE === 'table' ? "table" : "text",
   outThink: process.env.OUTPUT_THINK === 'true' ? true : false,
   redisURL: process.env.REDIS_URL || null,
-  autoRefresh: false,
+  autoRefresh: true,
   autoRefreshInterval: 6 * 60 * 60,
   defaultHeaders: {
     "Host": "chat.qwen.ai",

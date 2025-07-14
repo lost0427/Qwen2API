@@ -13,6 +13,9 @@ class Account {
 
     // 加载账户信息
     this.loadAccountTokens()
+    
+    // 立即刷新一次令牌
+    this.autoRefreshTokens()
 
     // 设置定期刷新令牌 (每6小时刷新一次)
     this.refreshInterval = setInterval(() => config.autoRefresh && this.autoRefreshTokens(), config.autoRefreshInterval * 1000)
@@ -50,8 +53,8 @@ class Account {
         this.accountTokens = []
       }
     } else if (config.dataSaveMode === "file") {
-      const Setting = JSON.parse(await fs.readFile(path.join(__dirname, '../../data/data.json'), 'utf-8'))
       try {
+        const Setting = JSON.parse(await fs.readFile(path.join(__dirname, '../../data/data.json'), 'utf-8'))
         if (Setting.accounts) {
           this.accountTokens = Setting.accounts
           console.log(`从文件中加载了 ${this.accountTokens.length} 个账户`)
@@ -59,6 +62,7 @@ class Account {
           this.accountTokens = []
         }
       } catch (error) {
+        console.error('读取 data.json 时出错:', error);
         this.accountTokens = []
       }
     } else {
@@ -74,7 +78,7 @@ class Account {
               email,
               password,
               token,
-              expiresAt: decoded.exp // 统一字段名为 expiresAt
+              expires: decoded.exp
             })
           }
         })
@@ -85,17 +89,36 @@ class Account {
     }
   }
 
+  // 新增保存账户令牌到文件的方法
+  async saveAccountTokens() {
+    if (config.dataSaveMode === "file") {
+      try {
+        const dataToSave = {
+          accounts: this.accountTokens
+        };
+        await fs.writeFile(path.join(__dirname, '../../data/data.json'), JSON.stringify(dataToSave, null, 2), 'utf-8');
+        console.log('账户令牌已成功保存到 data.json');
+      } catch (error) {
+        console.error('保存账户令牌到 data.json 时出错:', error);
+      }
+    }
+  }
+
 
   // 添加自动刷新令牌的方法
   async autoRefreshTokens() {
+    await this.loadAccountTokens();
     console.log('开始自动刷新令牌...')
 
     // 找出即将过期的令牌 (24小时内过期)
     const now = Math.floor(Date.now() / 1000)
     const expirationThreshold = now + 24 * 60 * 60
 
-    const needsRefresh = this.accountTokens.filter(token => token.expiresAt < expirationThreshold)
-
+    const needsRefresh = this.accountTokens.filter(token => {
+      console.log(`expirationThreshold: ${expirationThreshold} seconds (expires at: ${token.expires})`);
+      
+      return token.expires < expirationThreshold;
+    });
     if (needsRefresh.length === 0) {
       console.log('没有需要刷新的令牌')
       return 0
@@ -116,7 +139,7 @@ class Account {
   isTokenExpiringSoon(token, thresholdHours = 6) {
     const now = Math.floor(Date.now() / 1000)
     const thresholdSeconds = thresholdHours * 60 * 60
-    return token.expiresAt - now < thresholdSeconds
+    return token.expires - now < thresholdSeconds
   }
 
   getAccountToken() {
@@ -156,9 +179,10 @@ class Account {
           this.accountTokens[index] = {
             ...token,
             token: newToken,
-            expiresAt: decoded.exp, // 统一字段名为 expiresAt
+            expires: decoded.exp,
           }
           console.log(`刷新令牌成功: ${token.email} (还有${Math.round((decoded.exp - now) / 3600)}小时过期)`)
+          await this.saveAccountTokens(); 
           return true
         }
       }
