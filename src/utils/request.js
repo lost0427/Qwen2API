@@ -27,13 +27,24 @@ const sendChatRequest = async (body) => {
         // 构建请求配置
         const requestConfig = {
             headers: {
-                'authorization': `Bearer ${currentToken}`,
-                'Content-Type': 'application/json',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0',
+                'Authorization': `Bearer ${currentToken}`,
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0",
                 "Connection": "keep-alive",
-                "Accept": "*/*",
-                "Accept-Encoding": "gzip, deflate, br",
-                ...(config.ssxmodItna && { 'Cookie': `ssxmod_itna=${config.ssxmodItna};ssxmod_itna2=${config.ssxmodItna2}` })
+                "Accept": "application/json",
+                "Accept-Encoding": "gzip, deflate, br, zstd",
+                "Content-Type": "application/json",
+                "Timezone": "Mon Dec 08 2025 17:28:55 GMT+0800",
+                "sec-ch-ua": "\"Microsoft Edge\";v=\"143\", \"Chromium\";v=\"143\", \"Not A(Brand\";v=\"24\"",
+                "source": "web",
+                "Version": "0.1.13",
+                "bx-v": "2.5.31",
+                "Origin": "https://chat.qwen.ai",
+                "Sec-Fetch-Site": "same-origin",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Dest": "empty",
+                "Referer": "https://chat.qwen.ai/c/guest",
+                "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Cookie": `ssxmod_itna=${config.ssxmodItna};ssxmod_itna2=${config.ssxmodItna2}`,
             },
             responseType: 'stream', // Always use streaming (upstream doesn't support stream=false)
             timeout: 60 * 1000,
@@ -53,7 +64,7 @@ const sendChatRequest = async (body) => {
 
         // 请求成功
         if (response.status === 200) {
-            // console.log(response.data)
+            console.log(response.data)
             return {
                 currentToken: currentToken,
                 status: true,
@@ -89,16 +100,28 @@ const generateChatID = async (currentToken, model) => {
         }, {
             headers: {
                 'Authorization': `Bearer ${currentToken}`,
-                'Content-Type': 'application/json',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0', 
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0",
                 "Connection": "keep-alive",
-                "Accept": "*/*",
-                "Accept-Encoding": "gzip, deflate, br"
+                "Accept": "application/json",
+                "Accept-Encoding": "gzip, deflate, br, zstd",
+                "Content-Type": "application/json",
+                "Timezone": "Mon Dec 08 2025 17:28:55 GMT+0800",
+                "sec-ch-ua": "\"Microsoft Edge\";v=\"143\", \"Chromium\";v=\"143\", \"Not A(Brand\";v=\"24\"",
+                "source": "web",
+                "Version": "0.1.13",
+                "bx-v": "2.5.31",
+                "Origin": "https://chat.qwen.ai",
+                "Sec-Fetch-Site": "same-origin",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Dest": "empty",
+                "Referer": "https://chat.qwen.ai/c/guest",
+                "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Cookie": `ssxmod_itna=${config.ssxmodItna};ssxmod_itna2=${config.ssxmodItna2}`,
             }
         })
 
         // console.log(response_data.data)
-        
+
         return response_data.data?.data?.id || null
 
     } catch (error) {

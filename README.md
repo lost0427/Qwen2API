@@ -13,6 +13,24 @@
 
 ## 🛠️ 快速开始
 
+### 项目说明
+
+Qwen-Proxy 是一个将 `https://chat.qwen.ai` 和 `Qwen Code / Qwen Cli`端接口和转换为 OpenAI 兼容 API 的代理服务。通过本项目，您只需要一个账户，即可以使用任何支持 OpenAI API 的客户端（如 ChatGPT-Next-Web、LobeChat 等）来调用 `https://chat.qwen.ai` 和 `Qwen Code / Qwen Cli`的各种模型。其中 `/cli` 端点下的模型由 `Qwen Code / Qwen Cli` 提供，支持256k上下文，原生 tools 参数支持
+
+**主要特性：**
+- 兼容 OpenAI API 格式，无缝对接各类客户端
+- 支持多账户轮询，提高可用性
+- 支持流式/非流式响应
+- 支持多模态（图片识别、图片生成）
+- 支持智能搜索、深度思考等高级功能
+- 支持 CLI 端点，提供 256K 上下文和工具调用能力
+- 提供 Web 管理界面，方便配置和监控
+
+### 2025.12.8 紧急更新通知
+> 因官方风控严重必须填写 `SSXMOD_ITNA / SSXMOD_ITNA2`, 后续考虑使用部署外置的程序动态获取。(/cli端点不受影响)
+> 本次更新后不再内置 `SSXMOD_ITNA / SSXMOD_ITNA2`, 必须手动获取后填入环境变量。(下方有获取的文字教程和视频教程)
+> image-edit暂时不可用，请等待更新。(如果您已修复 欢迎pr)
+
 ### 环境要求
 
 - Node.js 18+ (源码部署时需要)
@@ -141,6 +159,8 @@ caches/
 3. 刷新页面或发送一条消息
 4. 在网络请求中找到任意请求，检查请求头中的 `Cookie` 字段
 5. 复制 `ssxmod_itna` 和 `ssxmod_itna2` 的值到环境变量中
+
+<video src="./docs/videos/ssxmod_itna.mp4" controls width="600"></video>
 
 **配置示例:**
 ```bash

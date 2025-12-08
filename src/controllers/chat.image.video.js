@@ -147,10 +147,24 @@ const handleImageVideoCompletion = async (req, res) => {
         const newChatType = reqBody.messages[0].chat_type
         const response_data = await axios.post(`https://chat.qwen.ai/api/v2/chat/completions?chat_id=${chat_id}`, reqBody, {
             headers: {
-                "Authorization": `Bearer ${token}`,
-                'Content-Type': 'application/json',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                ...(config.ssxmodItna && { 'Cookie': `ssxmod_itna=${config.ssxmodItna};ssxmod_itna2=${config.ssxmodItna2}` })
+                'Authorization': `Bearer ${token}`,
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0",
+                "Connection": "keep-alive",
+                "Accept": "application/json",
+                "Accept-Encoding": "gzip, deflate, br, zstd",
+                "Content-Type": "application/json",
+                "Timezone": "Mon Dec 08 2025 17:28:55 GMT+0800",
+                "sec-ch-ua": "\"Microsoft Edge\";v=\"143\", \"Chromium\";v=\"143\", \"Not A(Brand\";v=\"24\"",
+                "source": "web",
+                "Version": "0.1.13",
+                "bx-v": "2.5.31",
+                "Origin": "https://chat.qwen.ai",
+                "Sec-Fetch-Site": "same-origin",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Dest": "empty",
+                "Referer": "https://chat.qwen.ai/c/guest",
+                "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Cookie": `ssxmod_itna=${config.ssxmodItna};ssxmod_itna2=${config.ssxmodItna2}`,
             },
             responseType: newChatType == 't2i' ? 'stream' : 'json',
             timeout: 1000 * 60 * 5
@@ -162,6 +176,7 @@ const handleImageVideoCompletion = async (req, res) => {
                 const decoder = new TextDecoder('utf-8')
                 response_data.data.on('data', async (chunk) => {
                     const data = decoder.decode(chunk, { stream: true }).split('\n').filter(item => item.trim() != "")
+                    console.log(data)
                     for (const item of data) {
                         const jsonObj = JSON.parse(item.replace("data:", '').trim())
                         if (jsonObj && jsonObj.choices && jsonObj.choices[0] && jsonObj.choices[0].delta && jsonObj.choices[0].delta.content.trim() != "" && contentUrl == null) {
@@ -174,6 +189,7 @@ const handleImageVideoCompletion = async (req, res) => {
                     return returnResponse(res, model, contentUrl, req.body.stream)
                 })
             } else if (newChatType == 'image_edit') {
+                console.log(response_data.data)
                 contentUrl = response_data.data?.data?.choices[0]?.message?.content[0]?.image
                 return returnResponse(res, model, contentUrl, req.body.stream)
             } else if (newChatType == 't2v') {

@@ -31,7 +31,7 @@ class TokenManager {
       })
 
       if (response.data && response.data.token) {
-        logger.success(`${email} 登录成功`, 'AUTH')
+        logger.success(`${email} 登录成功：${response.data.token}`, 'AUTH')
         return response.data.token
       } else {
         logger.error(`${email} 登录响应缺少令牌`, 'AUTH')

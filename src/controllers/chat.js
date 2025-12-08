@@ -69,6 +69,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
 
         response.on('data', async (chunk) => {
             const decodeText = decoder.decode(chunk, { stream: true })
+            // console.log(decodeText)
             buffer += decodeText
 
             const chunks = []
