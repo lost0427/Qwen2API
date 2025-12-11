@@ -3,6 +3,7 @@ const bodyParser = require('body-parser')
 const config = require('./config/index.js')
 const cors = require('cors')
 const { logger } = require('./utils/logger')
+const { initSsxmodManager } = require('./utils/ssxmod-manager')
 const app = express()
 const path = require('path')
 const fs = require('fs')
@@ -18,6 +19,9 @@ if (config.dataSaveMode === 'file') {
     fs.writeFileSync(path.join(__dirname, '../data/data.json'), JSON.stringify({"accounts": [] }, null, 2))
   }
 }
+
+// 初始化 SSXMOD Cookie 管理器
+initSsxmodManager()
 
 app.use(bodyParser.json({ limit: '128mb' }))
 app.use(bodyParser.urlencoded({ limit: '128mb', extended: true }))

@@ -2,10 +2,9 @@
 
 # 🚀 Qwen-Proxy
 
-[![Version](https://img.shields.io/badge/version-2025.07.24.12.00-blue.svg)](https://github.com/Rfym21/Qwen2API)
+[![Version](https://img.shields.io/badge/version-2025.12.11-blue.svg)](https://github.com/Rfym21/Qwen2API)
 [![Node.js](https://img.shields.io/badge/Node.js-18+-green.svg)](https://nodejs.org/)
 [![Docker](https://img.shields.io/badge/Docker-supported-blue.svg)](https://hub.docker.com/r/rfym21/qwen2api)
-[![Binary](https://img.shields.io/badge/Binary-Available-orange.svg)](https://github.com/Rfym21/Qwen2API/releases)
 
 [🔗 加入交流群](https://t.me/nodejs_project) | [📖 文档](#api-文档) | [🐳 Docker 部署](#docker-部署)
 
@@ -25,11 +24,6 @@ Qwen-Proxy 是一个将 `https://chat.qwen.ai` 和 `Qwen Code / Qwen Cli`端接�
 - 支持智能搜索、深度思考等高级功能
 - 支持 CLI 端点，提供 256K 上下文和工具调用能力
 - 提供 Web 管理界面，方便配置和监控
-
-### 2025.12.8 紧急更新通知
-> 因官方风控严重必须填写 `SSXMOD_ITNA / SSXMOD_ITNA2`, 后续考虑使用部署外置的程序动态获取。(/cli端点不受影响)
-> 本次更新后不再内置 `SSXMOD_ITNA / SSXMOD_ITNA2`, 必须手动获取后填入环境变量。(下方有获取的文字教程和视频教程)
-> image-edit暂时不可用，请等待更新。(如果您已修复 欢迎pr)
 
 ### 环境要求
 
@@ -66,10 +60,6 @@ REDIS_URL=                    # Redis 连接地址 (可选，使用TLS时为redi
 
 # 📸 缓存配置
 CACHE_MODE=default            # 图片缓存模式 (default/file)
-
-# 🔑 高级配置
-SSXMOD_ITNA=                  # Qwen认证Cookie (可选)
-SSXMOD_ITNA2=                 # Qwen认证Cookie (可选)
 ```
 
 #### 📋 配置说明
@@ -87,13 +77,16 @@ SSXMOD_ITNA2=                 # Qwen认证Cookie (可选)
 | `DATA_SAVE_MODE` | 数据持久化方式 | `none`/`file`/`redis` |
 | `REDIS_URL` | Redis 数据库连接地址，使用TLS加密时需使用 `rediss://` 协议 | `redis://localhost:6379` 或 `rediss://xxx.upstash.io` |
 | `CACHE_MODE` | 图片缓存存储方式 | `default`/`file` |
-| `SSXMOD_ITNA` | Qwen 认证 Cookie 值，用于发送请求 | `1-Gqfx0DR70Q...` |
-| `SSXMOD_ITNA2` | Qwen 认证 Cookie 值，用于发送请求 | `1-Gqfx0DR70Q...` |
 | `LOG_LEVEL` | 日志级别 | `DEBUG`/`INFO`/`WARN`/`ERROR` |
 | `ENABLE_FILE_LOG` | 是否启用文件日志 | `true` 或 `false` |
 | `LOG_DIR` | 日志文件目录 | `./logs` |
 | `MAX_LOG_FILE_SIZE` | 最大日志文件大小(MB) | `10` |
 | `MAX_LOG_FILES` | 保留的日志文件数量 | `5` |
+
+> 💡 **提示**: 可以在 [Upstash](https://upstash.com/) 免费创建 Redis 实例，使用 TLS 协议时地址格式为 `rediss://...`
+<div>
+<img src="./docs/images/upstash.png" alt="Upstash Redis" width="600">
+</div>
 
 #### 🔑 多API_KEY配置说明
 
@@ -146,37 +139,6 @@ caches/
 ├── [signature2].txt
 └── ...
 ```
-
-> 💡 **提示**: 可以在 [Upstash](https://upstash.com/) 免费创建 Redis 实例，使用 TLS 协议时地址格式为 `rediss://...`
-
-#### 🔑 SSXMOD_ITNA/SSXMOD_ITNA2 配置说明
-
-`SSXMOD_ITNA` 和 `SSXMOD_ITNA2` 是 Qwen API 的认证 Cookie 参数，用于发送请求。
-
-**配置方法:**
-1. 使用浏览器访问 [https://chat.qwen.ai](https://chat.qwen.ai)
-2. 打开浏览器开发者工具（F12），切换到 "网络(Network)" 标签
-3. 刷新页面或发送一条消息
-4. 在网络请求中找到任意请求，检查请求头中的 `Cookie` 字段
-5. 复制 `ssxmod_itna` 和 `ssxmod_itna2` 的值到环境变量中
-
-<video src="./docs/videos/ssxmod_itna.mp4" controls width="600"></video>
-
-**配置示例:**
-```bash
-SSXMOD_ITNA=1-Gqfx0DR70QdiqY5i7G7GqDODkAb07qYWDzxC5iOD_xQ5K08D6GDBRRQpq9YP0=...
-SSXMOD_ITNA2=1-Gqfx0DR70QdiqY5i7G7GqDODkAb07qYWDzxC5iOD_xQ5K08D6GDBRRQpq9YP0=...
-```
-
-**作用说明:**
-- 这些 Cookie 值用于在请求时进行身份验证
-- 如果不配置，将使用默认值
-
-> ⚠️ **注意**: 这些 Cookie 值包含敏感信息，请妥善保管，不要分享给他人。
-
-<div>
-<img src="./docs/images/upstash.png" alt="Upstash Redis" width="600">
-</div>
 
 ---
 

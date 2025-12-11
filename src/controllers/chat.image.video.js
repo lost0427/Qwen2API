@@ -4,7 +4,7 @@ const { setResponseHeaders } = require('./chat.js')
 const accountManager = require('../utils/account.js')
 const { sleep } = require('../utils/tools.js')
 const { generateChatID } = require('../utils/request.js')
-const config = require('../config/index.js')
+const { getSsxmodItna, getSsxmodItna2 } = require('../utils/ssxmod-manager')
 
 /**
  * 主要的聊天完成处理函数
@@ -164,7 +164,7 @@ const handleImageVideoCompletion = async (req, res) => {
                 "Sec-Fetch-Dest": "empty",
                 "Referer": "https://chat.qwen.ai/c/guest",
                 "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-                "Cookie": `ssxmod_itna=${config.ssxmodItna};ssxmod_itna2=${config.ssxmodItna2}`,
+                "Cookie": `ssxmod_itna=${getSsxmodItna()};ssxmod_itna2=${getSsxmodItna2()}`,
             },
             responseType: newChatType == 't2i' ? 'stream' : 'json',
             timeout: 1000 * 60 * 5
@@ -312,7 +312,7 @@ const getVideoTaskStatus = async (videoTaskID, token) => {
                 "Authorization": `Bearer ${token}`,
                 'Content-Type': 'application/json',
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                ...(config.ssxmodItna && { 'Cookie': `ssxmod_itna=${config.ssxmodItna};ssxmod_itna2=${config.ssxmodItna2}` })
+                ...(getSsxmodItna() && { 'Cookie': `ssxmod_itna=${getSsxmodItna()};ssxmod_itna2=${getSsxmodItna2()}` })
             }
         })
 

@@ -37,9 +37,7 @@ const config = {
     enableFileLog: process.env.ENABLE_FILE_LOG === 'true',
     logDir: process.env.LOG_DIR || "./logs",
     maxLogFileSize: parseInt(process.env.MAX_LOG_FILE_SIZE) || 10,
-    maxLogFiles: parseInt(process.env.MAX_LOG_FILES) || 5,
-    ssxmodItna: process.env.SSXMOD_ITNA || "",
-    ssxmodItna2: process.env.SSXMOD_ITNA || ""
+    maxLogFiles: parseInt(process.env.MAX_LOG_FILES) || 5
 }
 
 module.exports = config

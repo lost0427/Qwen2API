@@ -40,23 +40,23 @@ const handleGetModels = async (req, res) => {
             models.push(newModelData)
         }
 
-        // if (isImage) {
-        //     const newModelData = JSON.parse(JSON.stringify(model))
-        //     newModelData.id = `${model.id}-image`
-        //     models.push(newModelData)
-        // }
+        if (isImage) {
+            const newModelData = JSON.parse(JSON.stringify(model))
+            newModelData.id = `${model.id}-image`
+            models.push(newModelData)
+        }
 
-        // if (isVideo) {
-        //     const newModelData = JSON.parse(JSON.stringify(model))
-        //     newModelData.id = `${model.id}-video`
-        //     models.push(newModelData)
-        // }
+        if (isVideo) {
+            const newModelData = JSON.parse(JSON.stringify(model))
+            newModelData.id = `${model.id}-video`
+            models.push(newModelData)
+        }
 
-        // if (isImageEdit) {
-        //     const newModelData = JSON.parse(JSON.stringify(model))
-        //     newModelData.id = `${model.id}-image-edit`
-        //     models.push(newModelData)
-        // }
+        if (isImageEdit) {
+            const newModelData = JSON.parse(JSON.stringify(model))
+            newModelData.id = `${model.id}-image-edit`
+            models.push(newModelData)
+        }
 
         // if (isDeepResearch) {
         //     const newModelData = JSON.parse(JSON.stringify(model))

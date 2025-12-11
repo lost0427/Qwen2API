@@ -9,9 +9,9 @@ const selectChatCompletion = (req, res, next) => {
     const ChatCompletionMap = {
         't2t': handleChatCompletion,
         'search': handleChatCompletion,
-        // 't2i': handleImageVideoCompletion,
-        // 't2v': handleImageVideoCompletion,
-        // 'image_edit': handleImageVideoCompletion,
+        't2i': handleImageVideoCompletion,
+        't2v': handleImageVideoCompletion,
+        'image_edit': handleImageVideoCompletion,
         //   'deep_research': handleDeepResearchCompletion
     }
 

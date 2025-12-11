@@ -2,6 +2,7 @@ const axios = require('axios')
 const config = require('../config/index.js')
 const accountManager = require('./account.js')
 const { logger } = require('./logger')
+const { getSsxmodItna, getSsxmodItna2 } = require('./ssxmod-manager')
 
 
 /**
@@ -44,7 +45,7 @@ const sendChatRequest = async (body) => {
                 "Sec-Fetch-Dest": "empty",
                 "Referer": "https://chat.qwen.ai/c/guest",
                 "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-                "Cookie": `ssxmod_itna=${config.ssxmodItna};ssxmod_itna2=${config.ssxmodItna2}`,
+                "Cookie": `ssxmod_itna=${getSsxmodItna()};ssxmod_itna2=${getSsxmodItna2()}`,
             },
             responseType: 'stream', // Always use streaming (upstream doesn't support stream=false)
             timeout: 60 * 1000,
@@ -64,7 +65,7 @@ const sendChatRequest = async (body) => {
 
         // 请求成功
         if (response.status === 200) {
-            console.log(response.data)
+            // console.log(response.data)
             return {
                 currentToken: currentToken,
                 status: true,
@@ -116,7 +117,7 @@ const generateChatID = async (currentToken, model) => {
                 "Sec-Fetch-Dest": "empty",
                 "Referer": "https://chat.qwen.ai/c/guest",
                 "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-                "Cookie": `ssxmod_itna=${config.ssxmodItna};ssxmod_itna2=${config.ssxmodItna2}`,
+                "Cookie": `ssxmod_itna=${getSsxmodItna()};ssxmod_itna2=${getSsxmodItna2()}`,
             }
         })
 

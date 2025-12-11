@@ -1,6 +1,6 @@
 const axios = require('axios')
 const accountManager = require('../utils/account.js')
-const config = require('../config/index.js')
+const { getSsxmodItna, getSsxmodItna2 } = require('../utils/ssxmod-manager')
 
 let cachedModels = null
 let fetchPromise = null
@@ -21,7 +21,7 @@ const getLatestModels = async (force = false) => {
             'Authorization': `Bearer ${accountManager.getAccountToken()}`,
             'Content-Type': 'application/json',
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            ...(config.ssxmodItna && { 'Cookie': `ssxmod_itna=${config.ssxmodItna};ssxmod_itna2=${config.ssxmodItna2}` })
+            ...(getSsxmodItna() && { 'Cookie': `ssxmod_itna=${getSsxmodItna()};ssxmod_itna2=${getSsxmodItna2()}` })
         }
     }).then(response => {
         // console.log(response)
