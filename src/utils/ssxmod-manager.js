@@ -3,7 +3,7 @@
  * 负责生成和定时刷新 ssxmod_itna 和 ssxmod_itna2 Cookie
  */
 
-const { generateCookies } = require('./cookie_generator');
+const { generateCookies } = require('./cookie-generator');
 const { logger } = require('./logger');
 
 // 全局 Cookie 存储

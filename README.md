@@ -2,7 +2,7 @@
 
 # 🚀 Qwen-Proxy
 
-[![Version](https://img.shields.io/badge/version-2025.12.11-blue.svg)](https://github.com/Rfym21/Qwen2API)
+[![Version](https://img.shields.io/badge/version-2025.12.14-blue.svg)](https://github.com/Rfym21/Qwen2API)
 [![Node.js](https://img.shields.io/badge/Node.js-18+-green.svg)](https://nodejs.org/)
 [![Docker](https://img.shields.io/badge/Docker-supported-blue.svg)](https://hub.docker.com/r/rfym21/qwen2api)
 
@@ -14,7 +14,7 @@
 
 ### 项目说明
 
-Qwen-Proxy 是一个将 `https://chat.qwen.ai` 和 `Qwen Code / Qwen Cli`端接口和转换为 OpenAI 兼容 API 的代理服务。通过本项目，您只需要一个账户，即可以使用任何支持 OpenAI API 的客户端（如 ChatGPT-Next-Web、LobeChat 等）来调用 `https://chat.qwen.ai` 和 `Qwen Code / Qwen Cli`的各种模型。其中 `/cli` 端点下的模型由 `Qwen Code / Qwen Cli` 提供，支持256k上下文，原生 tools 参数支持
+Qwen-Proxy 是一个将 `https://chat.qwen.ai` 和 `Qwen Code / Qwen Cli` 转换为 OpenAI 兼容 API 的代理服务。通过本项目，您只需要一个账户，即可以使用任何支持 OpenAI API 的客户端（如 ChatGPT-Next-Web、LobeChat 等）来调用 `https://chat.qwen.ai` 和 `Qwen Code / Qwen Cli`的各种模型。其中 `/cli` 端点下的模型由 `Qwen Code / Qwen Cli` 提供，支持256k上下文，原生 tools 参数支持
 
 **主要特性：**
 - 兼容 OpenAI API 格式，无缝对接各类客户端
@@ -24,6 +24,29 @@ Qwen-Proxy 是一个将 `https://chat.qwen.ai` 和 `Qwen Code / Qwen Cli`端接�
 - 支持智能搜索、深度思考等高级功能
 - 支持 CLI 端点，提供 256K 上下文和工具调用能力
 - 提供 Web 管理界面，方便配置和监控
+
+### ⚠️ 高并发说明
+
+> **重要提示**: `chat.qwen.ai` 对单 IP 有限速策略，目前已知该限制与 Cookie 无关，仅与 IP 相关。
+
+**解决方案：**
+
+如需高并发使用，建议配合代理池实现 IP 轮换：
+
+| 方案 | 配置方式 | 说明 |
+|------|----------|------|
+| **方案一** | `PROXY_URL` + [ProxyFlow](https://github.com/Rfym21/ProxyFlow) | 直接配置代理地址，所有请求通过代理池轮换 IP |
+| **方案二** | `QWEN_CHAT_PROXY_URL` + [UrlProxy](https://github.com/Rfym21/UrlProxy) + [ProxyFlow](https://github.com/Rfym21/ProxyFlow) | 通过反代 + 代理池组合，实现更灵活的 IP 轮换 |
+
+**配置示例：**
+
+```bash
+# 方案一：直接使用代理池
+PROXY_URL=http://127.0.0.1:8282  # ProxyFlow 代理地址
+
+# 方案二：反代 + 代理池组合
+QWEN_CHAT_PROXY_URL=http://127.0.0.1:8000/qwen  # UrlProxy 反代地址（UrlProxy 配置 HTTP_PROXY 指向 ProxyFlow）
+```
 
 ### 环境要求
 
@@ -54,6 +77,11 @@ SEARCH_INFO_MODE=table        # 搜索信息展示模式 (table/text)
 OUTPUT_THINK=true             # 是否输出思考过程 (true/false)
 SIMPLE_MODEL_MAP=false        # 简化模型映射 (true/false)
 
+# 🌐 代理与反代配置
+QWEN_CHAT_PROXY_URL=          # 自定义 Chat API 反代URL (默认: https://chat.qwen.ai)
+QWEN_CLI_PROXY_URL=           # 自定义 CLI API 反代URL (默认: https://portal.qwen.ai)
+PROXY_URL=                    # HTTP/HTTPS/SOCKS5 代理地址 (例如: http://127.0.0.1:7890)
+
 # 🗄️ 数据存储
 DATA_SAVE_MODE=none           # 数据保存模式 (none/file/redis)
 REDIS_URL=                    # Redis 连接地址 (可选，使用TLS时为rediss://)
@@ -74,6 +102,9 @@ CACHE_MODE=default            # 图片缓存模式 (default/file)
 | `SEARCH_INFO_MODE` | 搜索结果展示格式 | `table` 或 `text` |
 | `OUTPUT_THINK` | 是否显示 AI 思考过程 | `true` 或 `false` |
 | `SIMPLE_MODEL_MAP` | 简化模型映射，只返回基础模型不包含变体 | `true` 或 `false` |
+| `QWEN_CHAT_PROXY_URL` | 自定义 Chat API 反代地址 | `https://your-proxy.com` |
+| `QWEN_CLI_PROXY_URL` | 自定义 CLI API 反代地址 | `https://your-cli-proxy.com` |
+| `PROXY_URL` | 出站请求代理地址，支持 HTTP/HTTPS/SOCKS5 | `http://127.0.0.1:7890` |
 | `DATA_SAVE_MODE` | 数据持久化方式 | `none`/`file`/`redis` |
 | `REDIS_URL` | Redis 数据库连接地址，使用TLS加密时需使用 `rediss://` 协议 | `redis://localhost:6379` 或 `rediss://xxx.upstash.io` |
 | `CACHE_MODE` | 图片缓存存储方式 | `default`/`file` |
@@ -164,7 +195,7 @@ docker run -d \
 
 ```bash
 # 下载配置文件
-curl -o docker-compose.yml https://raw.githubusercontent.com/Rfym21/Qwen2API/refs/heads/main/docker-compose.yml
+curl -o docker-compose.yml https://raw.githubusercontent.com/Rfym21/Qwen2API/refs/heads/main/docker/docker-compose.yml
 
 # 启动服务
 docker compose pull && docker compose up -d
@@ -221,17 +252,21 @@ npm run dev
 
 ```
 Qwen2API/
-├── Dockerfile
 ├── README.md
-├── docker-compose.yml
-├── docker-compose-redis.yml
 ├── ecosystem.config.js              # PM2配置文件
 ├── package.json
+│
+├── docker/                          # Docker配置目录
+│   ├── Dockerfile
+│   ├── docker-compose.yml
+│   └── docker-compose-redis.yml
 │
 ├── caches/                          # 缓存文件目录
 ├── data/                            # 数据文件目录
 │   ├── data.json
 │   └── data_template.json
+├── scripts/                         # 脚本目录
+│   └── fingerprint-injector.js      # 浏览器指纹注入脚本
 │
 ├── src/                             # 后端源代码目录
 │   ├── server.js                    # 主服务器文件
@@ -239,37 +274,41 @@ Qwen2API/
 │   ├── config/
 │   │   └── index.js                 # 配置文件
 │   ├── controllers/                 # 控制器目录
-│   │   ├── chat.js
+│   │   ├── chat.js                  # 聊天控制器
+│   │   ├── chat.image.video.js      # 图片/视频生成控制器
 │   │   ├── cli.chat.js              # CLI聊天控制器
-│   │   └── models.js
+│   │   └── models.js                # 模型控制器
 │   ├── middlewares/                 # 中间件目录
-│   │   ├── authorization.js
-│   │   └── chat-middleware.js
+│   │   ├── authorization.js         # 授权中间件
+│   │   └── chat-middleware.js       # 聊天中间件
 │   ├── models/                      # 模型目录
-│   │   └── models-map.js
+│   │   └── models-map.js            # 模型映射配置
 │   ├── routes/                      # 路由目录
-│   │   ├── accounts.js
-│   │   ├── chat.js
+│   │   ├── accounts.js              # 账户路由
+│   │   ├── chat.js                  # 聊天路由
 │   │   ├── cli.chat.js              # CLI聊天路由
-│   │   ├── models.js
-│   │   ├── settings.js
-│   │   └── verify.js
+│   │   ├── models.js                # 模型路由
+│   │   ├── settings.js              # 设置路由
+│   │   └── verify.js                # 验证路由
 │   └── utils/                       # 工具函数目录
-│       ├── account-rotator.js
-│       ├── account.js
-│       ├── chat-helpers.js
+│       ├── account-rotator.js       # 账户轮询器
+│       ├── account.js               # 账户管理
+│       ├── chat-helpers.js          # 聊天辅助函数
 │       ├── cli.manager.js           # CLI管理器
-│       ├── data-persistence.js
-│       ├── img-caches.js
+│       ├── cookie-generator.js      # Cookie生成器
+│       ├── data-persistence.js      # 数据持久化
+│       ├── fingerprint.js           # 浏览器指纹生成
+│       ├── img-caches.js            # 图片缓存
 │       ├── logger.js                # 日志工具
-│       ├── model-utils.js
 │       ├── precise-tokenizer.js     # 精确分词器
-│       ├── redis.js
-│       ├── request.js
-│       ├── setting.js
-│       ├── token-manager.js
-│       ├── tools.js
-│       └── upload.js
+│       ├── proxy-helper.js          # 代理辅助函数
+│       ├── redis.js                 # Redis连接
+│       ├── request.js               # HTTP请求封装
+│       ├── setting.js               # 设置管理
+│       ├── ssxmod-manager.js        # ssxmod参数管理
+│       ├── token-manager.js         # Token管理器
+│       ├── tools.js                 # 工具调用处理
+│       └── upload.js                # 文件上传
 │
 └── public/                          # 前端项目目录
     ├── dist/                        # 编译后的前端文件
@@ -408,7 +447,7 @@ Authorization: Bearer sk-your-api-key
 
 使用 `-image` 模型启用文本到图像生成功能。
 使用 `-image-edit` 模型启用图像修改功能。
-当使用``-image` 时你可以通过在请求体中添加 `size` 参数或在消息内容中包含特定关键词 `1:1`, `4:3`, `3:4`, `16:9`, `9:16` 来控制图片尺寸。
+当使用 `-image` 模型时你可以通过在请求体中添加 `size` 参数或在消息内容中包含特定关键词 `1:1`, `4:3`, `3:4`, `16:9`, `9:16` 来控制图片尺寸。
 
 ```http
 POST /v1/chat/completions

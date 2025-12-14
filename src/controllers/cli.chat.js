@@ -1,5 +1,6 @@
 const axios = require('axios')
 const { logger } = require('../utils/logger')
+const { getProxyAgent, getCliBaseUrl, applyProxyToAxiosConfig } = require('../utils/proxy-helper')
 
 /**
  * 处理CLI聊天完成请求（支持OpenAI格式的流式和JSON响应）
@@ -18,10 +19,13 @@ const handleCliChatCompletion = async (req, res) => {
         // 无论成功失败都增加请求计数
         req.account.cli_info.request_number++
 
+        const cliBaseUrl = getCliBaseUrl()
+        const proxyAgent = getProxyAgent()
+
         // 设置请求配置
         const axiosConfig = {
             method: 'POST',
-            url: 'https://portal.qwen.ai/v1/chat/completions',
+            url: `${cliBaseUrl}/v1/chat/completions`,
             headers: {
                 'Authorization': `Bearer ${access_token}`,
                 'Content-Type': 'application/json',
@@ -32,6 +36,12 @@ const handleCliChatCompletion = async (req, res) => {
             validateStatus: function () {
                 return true
             }
+        }
+
+        // 添加代理配置
+        if (proxyAgent) {
+            axiosConfig.httpsAgent = proxyAgent
+            axiosConfig.proxy = false
         }
 
         // 如果是流式请求，设置响应类型为流

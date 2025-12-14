@@ -37,7 +37,12 @@ const config = {
     enableFileLog: process.env.ENABLE_FILE_LOG === 'true',
     logDir: process.env.LOG_DIR || "./logs",
     maxLogFileSize: parseInt(process.env.MAX_LOG_FILE_SIZE) || 10,
-    maxLogFiles: parseInt(process.env.MAX_LOG_FILES) || 5
+    maxLogFiles: parseInt(process.env.MAX_LOG_FILES) || 5,
+    // 自定义反代URL配置
+    qwenChatProxyUrl: process.env.QWEN_CHAT_PROXY_URL || "https://chat.qwen.ai",
+    qwenCliProxyUrl: process.env.QWEN_CLI_PROXY_URL || "https://portal.qwen.ai",
+    // 代理配置
+    proxyUrl: process.env.PROXY_URL || null
 }
 
 module.exports = config

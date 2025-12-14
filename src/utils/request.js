@@ -1,8 +1,8 @@
 const axios = require('axios')
-const config = require('../config/index.js')
 const accountManager = require('./account.js')
 const { logger } = require('./logger')
 const { getSsxmodItna, getSsxmodItna2 } = require('./ssxmod-manager')
+const { getProxyAgent, getChatBaseUrl, applyProxyToAxiosConfig } = require('./proxy-helper')
 
 
 /**
@@ -25,6 +25,9 @@ const sendChatRequest = async (body) => {
             }
         }
 
+        const chatBaseUrl = getChatBaseUrl()
+        const proxyAgent = getProxyAgent()
+
         // 构建请求配置
         const requestConfig = {
             headers: {
@@ -39,16 +42,22 @@ const sendChatRequest = async (body) => {
                 "source": "web",
                 "Version": "0.1.13",
                 "bx-v": "2.5.31",
-                "Origin": "https://chat.qwen.ai",
+                "Origin": chatBaseUrl,
                 "Sec-Fetch-Site": "same-origin",
                 "Sec-Fetch-Mode": "cors",
                 "Sec-Fetch-Dest": "empty",
-                "Referer": "https://chat.qwen.ai/c/guest",
+                "Referer": `${chatBaseUrl}/c/guest`,
                 "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
                 "Cookie": `ssxmod_itna=${getSsxmodItna()};ssxmod_itna2=${getSsxmodItna2()}`,
             },
             responseType: 'stream', // Always use streaming (upstream doesn't support stream=false)
             timeout: 60 * 1000,
+        }
+
+        // 添加代理配置
+        if (proxyAgent) {
+            requestConfig.httpsAgent = proxyAgent
+            requestConfig.proxy = false // 禁用axios默认代理，使用httpsAgent
         }
 
         // console.log(body)
@@ -57,7 +66,7 @@ const sendChatRequest = async (body) => {
         const chat_id = await generateChatID(currentToken, body.model)
 
         logger.network(`发送聊天请求`, 'REQUEST')
-        const response = await axios.post("https://chat.qwen.ai/api/v2/chat/completions?chat_id=" + chat_id, {
+        const response = await axios.post(`${chatBaseUrl}/api/v2/chat/completions?chat_id=` + chat_id, {
             ...body,
             stream: true, // Always request streaming (upstream doesn't support stream=false)
             chat_id: chat_id
@@ -90,15 +99,10 @@ const sendChatRequest = async (body) => {
  */
 const generateChatID = async (currentToken, model) => {
     try {
-        const response_data = await axios.post("https://chat.qwen.ai/api/v2/chats/new", {
-            "title": "New Chat",
-            "models": [
-                model
-            ],
-            "chat_mode": "local",
-            "chat_type": "t2i",
-            "timestamp": new Date().getTime()
-        }, {
+        const chatBaseUrl = getChatBaseUrl()
+        const proxyAgent = getProxyAgent()
+
+        const requestConfig = {
             headers: {
                 'Authorization': `Bearer ${currentToken}`,
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0",
@@ -111,15 +115,31 @@ const generateChatID = async (currentToken, model) => {
                 "source": "web",
                 "Version": "0.1.13",
                 "bx-v": "2.5.31",
-                "Origin": "https://chat.qwen.ai",
+                "Origin": chatBaseUrl,
                 "Sec-Fetch-Site": "same-origin",
                 "Sec-Fetch-Mode": "cors",
                 "Sec-Fetch-Dest": "empty",
-                "Referer": "https://chat.qwen.ai/c/guest",
+                "Referer": `${chatBaseUrl}/c/guest`,
                 "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
                 "Cookie": `ssxmod_itna=${getSsxmodItna()};ssxmod_itna2=${getSsxmodItna2()}`,
             }
-        })
+        }
+
+        // 添加代理配置
+        if (proxyAgent) {
+            requestConfig.httpsAgent = proxyAgent
+            requestConfig.proxy = false
+        }
+
+        const response_data = await axios.post(`${chatBaseUrl}/api/v2/chats/new`, {
+            "title": "New Chat",
+            "models": [
+                model
+            ],
+            "chat_mode": "local",
+            "chat_type": "t2i",
+            "timestamp": new Date().getTime()
+        }, requestConfig)
 
         // console.log(response_data.data)
 

@@ -1,6 +1,7 @@
 const axios = require('axios')
 const accountManager = require('../utils/account.js')
 const { getSsxmodItna, getSsxmodItna2 } = require('../utils/ssxmod-manager')
+const { getProxyAgent, getChatBaseUrl, applyProxyToAxiosConfig } = require('../utils/proxy-helper')
 
 let cachedModels = null
 let fetchPromise = null
@@ -10,20 +11,31 @@ const getLatestModels = async (force = false) => {
     if (cachedModels && !force) {
         return cachedModels
     }
-    
+
     // 如果正在获取，返回当前的 Promise
     if (fetchPromise) {
         return fetchPromise
     }
-    
-    fetchPromise = axios.get('https://chat.qwen.ai/api/models', {
+
+    const chatBaseUrl = getChatBaseUrl()
+    const proxyAgent = getProxyAgent()
+
+    const requestConfig = {
         headers: {
             'Authorization': `Bearer ${accountManager.getAccountToken()}`,
             'Content-Type': 'application/json',
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             ...(getSsxmodItna() && { 'Cookie': `ssxmod_itna=${getSsxmodItna()};ssxmod_itna2=${getSsxmodItna2()}` })
         }
-    }).then(response => {
+    }
+
+    // 添加代理配置
+    if (proxyAgent) {
+        requestConfig.httpsAgent = proxyAgent
+        requestConfig.proxy = false
+    }
+
+    fetchPromise = axios.get(`${chatBaseUrl}/api/models`, requestConfig).then(response => {
         // console.log(response)
         cachedModels = response.data.data
         fetchPromise = null
@@ -33,7 +45,7 @@ const getLatestModels = async (force = false) => {
         fetchPromise = null
         return []
     })
-    
+
     return fetchPromise
 }
 

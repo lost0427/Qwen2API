@@ -5,6 +5,7 @@ const accountManager = require('../utils/account.js')
 const { sleep } = require('../utils/tools.js')
 const { generateChatID } = require('../utils/request.js')
 const { getSsxmodItna, getSsxmodItna2 } = require('../utils/ssxmod-manager')
+const { getProxyAgent, getChatBaseUrl, applyProxyToAxiosConfig } = require('../utils/proxy-helper')
 
 /**
  * 主要的聊天完成处理函数
@@ -36,7 +37,7 @@ const handleImageVideoCompletion = async (req, res) => {
             ]
         }
 
-        const chat_id = await generateChatID(token,model)
+        const chat_id = await generateChatID(token, model)
 
         if (!chat_id) {
             // 如果生成chat_id失败，则返回错误
@@ -140,12 +141,16 @@ const handleImageVideoCompletion = async (req, res) => {
             }
         }
 
+        const chatBaseUrl = getChatBaseUrl()
+        const proxyAgent = getProxyAgent()
+
         logger.info('发送图片视频请求', 'CHAT')
         logger.info(`选择图片: ${select_image_list[select_image_list.length - 1] || "未选择图片，切换生成图/视频模式"}`, 'CHAT')
         logger.info(`使用提示: ${reqBody.messages[0].content}`, 'CHAT')
         // console.log(JSON.stringify(reqBody))
         const newChatType = reqBody.messages[0].chat_type
-        const response_data = await axios.post(`https://chat.qwen.ai/api/v2/chat/completions?chat_id=${chat_id}`, reqBody, {
+
+        const requestConfig = {
             headers: {
                 'Authorization': `Bearer ${token}`,
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0",
@@ -158,17 +163,25 @@ const handleImageVideoCompletion = async (req, res) => {
                 "source": "web",
                 "Version": "0.1.13",
                 "bx-v": "2.5.31",
-                "Origin": "https://chat.qwen.ai",
+                "Origin": chatBaseUrl,
                 "Sec-Fetch-Site": "same-origin",
                 "Sec-Fetch-Mode": "cors",
                 "Sec-Fetch-Dest": "empty",
-                "Referer": "https://chat.qwen.ai/c/guest",
+                "Referer": `${chatBaseUrl}/c/guest`,
                 "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
                 "Cookie": `ssxmod_itna=${getSsxmodItna()};ssxmod_itna2=${getSsxmodItna2()}`,
             },
             responseType: newChatType == 't2i' ? 'stream' : 'json',
             timeout: 1000 * 60 * 5
-        })
+        }
+
+        // 添加代理配置
+        if (proxyAgent) {
+            requestConfig.httpsAgent = proxyAgent
+            requestConfig.proxy = false
+        }
+
+        const response_data = await axios.post(`${chatBaseUrl}/api/v2/chat/completions?chat_id=${chat_id}`, reqBody, requestConfig)
 
         try {
             let contentUrl = null
@@ -307,14 +320,25 @@ ${content}
 
 const getVideoTaskStatus = async (videoTaskID, token) => {
     try {
-        const response_data = await axios.get(`https://chat.qwen.ai/api/v1/tasks/status/${videoTaskID}`, {
+        const chatBaseUrl = getChatBaseUrl()
+        const proxyAgent = getProxyAgent()
+
+        const requestConfig = {
             headers: {
                 "Authorization": `Bearer ${token}`,
                 'Content-Type': 'application/json',
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                 ...(getSsxmodItna() && { 'Cookie': `ssxmod_itna=${getSsxmodItna()};ssxmod_itna2=${getSsxmodItna2()}` })
             }
-        })
+        }
+
+        // 添加代理配置
+        if (proxyAgent) {
+            requestConfig.httpsAgent = proxyAgent
+            requestConfig.proxy = false
+        }
+
+        const response_data = await axios.get(`${chatBaseUrl}/api/v1/tasks/status/${videoTaskID}`, requestConfig)
 
         if (response_data.data?.task_status == "success") {
             logger.info('获取视频任务状态成功', 'CHAT', response_data.data?.content)

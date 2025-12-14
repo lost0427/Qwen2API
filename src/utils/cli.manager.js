@@ -1,4 +1,5 @@
 const crypto = require('crypto')
+const { getProxyAgent, getChatBaseUrl, applyProxyToFetchOptions } = require('./proxy-helper')
 
 /**
  * 为 PKCE 生成随机代码验证器
@@ -48,15 +49,25 @@ class CliAuthManager {
             code_challenge_method: 'S256',
         })
 
+        const chatBaseUrl = getChatBaseUrl()
+        const proxyAgent = getProxyAgent()
+
+        const fetchOptions = {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                Accept: 'application/json',
+            },
+            body: bodyData,
+        }
+
+        // 添加代理配置
+        if (proxyAgent) {
+            fetchOptions.agent = proxyAgent
+        }
+
         try {
-            const response = await fetch("https://chat.qwen.ai/api/v1/oauth2/device/code", {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                    Accept: 'application/json',
-                },
-                body: bodyData,
-            })
+            const response = await fetch(`${chatBaseUrl}/api/v1/oauth2/device/code`, fetchOptions)
 
             if (response.ok) {
                 const result = await response.json()
@@ -89,7 +100,10 @@ class CliAuthManager {
      */
     async authorizeLogin(user_code, access_token) {
         try {
-            const response = await fetch("https://chat.qwen.ai/api/v2/oauth2/authorize", {
+            const chatBaseUrl = getChatBaseUrl()
+            const proxyAgent = getProxyAgent()
+
+            const fetchOptions = {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -99,7 +113,13 @@ class CliAuthManager {
                     "approved": true,
                     "user_code": user_code
                 })
-            })
+            }
+
+            if (proxyAgent) {
+                fetchOptions.agent = proxyAgent
+            }
+
+            const response = await fetch(`${chatBaseUrl}/api/v2/oauth2/authorize`, fetchOptions)
 
             if (response.ok) {
                 return true
@@ -120,6 +140,8 @@ class CliAuthManager {
     async pollForToken(device_code, code_verifier) {
         let pollInterval = 5000
         const maxAttempts = 60
+        const chatBaseUrl = getChatBaseUrl()
+        const proxyAgent = getProxyAgent()
 
         for (let attempt = 0; attempt < maxAttempts; attempt++) {
             const bodyData = new URLSearchParams({
@@ -129,15 +151,21 @@ class CliAuthManager {
                 code_verifier: code_verifier,
             })
 
+            const fetchOptions = {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    Accept: 'application/json',
+                },
+                body: bodyData,
+            }
+
+            if (proxyAgent) {
+                fetchOptions.agent = proxyAgent
+            }
+
             try {
-                const response = await fetch("https://chat.qwen.ai/api/v1/oauth2/token", {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/x-www-form-urlencoded',
-                        Accept: 'application/json',
-                    },
-                    body: bodyData,
-                })
+                const response = await fetch(`${chatBaseUrl}/api/v1/oauth2/token`, fetchOptions)
 
                 if (response.ok) {
 
@@ -203,20 +231,29 @@ class CliAuthManager {
                 throw new Error()
             }
 
+            const chatBaseUrl = getChatBaseUrl()
+            const proxyAgent = getProxyAgent()
+
             const bodyData = new URLSearchParams({
                 grant_type: 'refresh_token',
                 refresh_token: CliAccount.refresh_token,
                 client_id: "f0304373b74a44d2b584a3fb70ca9e56",
             })
 
-            const response = await fetch("https://chat.qwen.ai/api/v1/oauth2/token", {
+            const fetchOptions = {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/x-www-form-urlencoded',
                     Accept: 'application/json',
                 },
                 body: bodyData
-            })
+            }
+
+            if (proxyAgent) {
+                fetchOptions.agent = proxyAgent
+            }
+
+            const response = await fetch(`${chatBaseUrl}/api/v1/oauth2/token`, fetchOptions)
 
             if (response.ok) {
                 const tokenData = await response.json()
