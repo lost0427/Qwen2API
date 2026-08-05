@@ -31,6 +31,23 @@ const serializeToolArguments = (args) => {
   return JSON.stringify(args ?? {});
 };
 
+const compactDescription = (value, maxLength = 320) => {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, maxLength - 1)}…`;
+};
+
+/**
+ * 识别模型用“我将执行/Let me inspect”代替真实工具调用的占位回复。
+ * 仅匹配明确的动作动词，避免把普通解释或建议误判成工具回合。
+ */
+const looksLikeUnexecutedToolAction = (value) => {
+  const text = String(value || '').trim().replace(/^[#>*\-\s]+/, '');
+  const english = /^(?:i(?:['’]ll| will)|let me|i need to|next,?\s+i(?:['’]ll| will))\s+(?:now\s+)?(?:run|execute|check|inspect|read|edit|write|search|open|call|use|look|test|verify|build|deploy|create|update|fetch)\b/i;
+  const chinese = /^(?:我(?:将|会|先|需要|正在)|让我|接下来(?:我)?(?:将|会|先)?|现在(?:我)?(?:将|会|先|来)?|下面(?:我)?(?:将|会|先)?|正在)(?:立即|马上|先|来)?(?:运行|执行|检查|查看|读取|编辑|修改|写入|搜索|打开|调用|使用|测试|验证|构建|部署|创建|更新|获取)/;
+  return english.test(text) || chinese.test(text);
+};
+
 const createToolCallObject = (payload, index = 0, id = null) => ({
   index,
   id: id || `call_${generateUUID().replace(/-/g, '').slice(0, 24)}`,
@@ -69,7 +86,8 @@ const compressSchemaType = (schema) => {
     const requiredKeys = new Set(Array.isArray(schema.required) ? schema.required : []);
     const fields = Object.entries(schema.properties).map(([key, value]) => {
       const optional = requiredKeys.has(key) ? '' : '?';
-      return `${key}${optional}: ${compressSchemaType(value)}`;
+      const description = compactDescription(value?.description, 180);
+      return `${key}${optional}: ${compressSchemaType(value)}${description ? ` /* ${description.replace(/\*\//g, '* /')} */` : ''}`;
     });
     return `{ ${fields.join('; ')} }`;
   }
@@ -89,7 +107,7 @@ const compressSchemaType = (schema) => {
 const compressToolDefinition = (tool) => {
   const fn = tool?.function || tool;
   const name = fn?.name || 'unknown';
-  const description = (fn?.description || '').trim();
+  const description = compactDescription(fn?.description);
   const params = fn?.parameters || { type: 'object', properties: {} };
   const signature = compressSchemaType(params);
 
@@ -119,7 +137,7 @@ const buildToolSystemPrompt = (tools, options = {}) => {
   const lines = [
     '# Tools',
     '',
-    'You have access to the following tools. When a tool call is needed, output a `<tool_call>` block exactly as shown below.',
+    'You have access to the following tools. This is an Agent tool protocol, not a suggestion.',
     '',
     '## Available tools',
     compressed,
@@ -138,12 +156,15 @@ const buildToolSystemPrompt = (tools, options = {}) => {
     '</tool_response>',
     '',
     'Rules:',
+    '- If the task requires reading, writing, editing, searching, shell execution, browser use, or any action covered by an available tool, your visible response MUST be a `<tool_call>` block. Call the tool instead of describing the action.',
+    '- A tool call must be the first non-whitespace content of the visible answer. Do not write “I will…”, “Let me…”, “我将…”, “正在…”, a plan, or a completion claim before it.',
     '- The JSON inside `<tool_call>` must be valid and on a single logical block.',
     '- Use the exact tool name listed above.',
     '- Provide all required arguments; omit unknown ones.',
     '- You may emit multiple `<tool_call>` blocks back-to-back when more than one tool is needed.',
-    '- After tool results are returned (as user/tool messages), continue the reply normally.',
-    '- Do not wrap `<tool_call>` blocks in code fences or extra commentary.'
+    '- After every tool result, evaluate the actual task state. If work remains, emit the next tool call. Only return a normal-language final answer after the requested task is genuinely complete or you are blocked on user input.',
+    '- Never claim that a file was changed, a command succeeded, or a result was verified unless the corresponding tool result proves it.',
+    '- Do not call nonexistent tools, fabricate tool results, wrap `<tool_call>` in code fences, or mix extra commentary into a tool-call turn.'
   ];
 
   const choice = options.tool_choice;
@@ -200,8 +221,8 @@ const foldToolMessages = (messages) => {
       const callId = message.tool_call_id || '';
       const name = message.name || callIdToName.get(callId) || 'tool';
       const content = typeof message.content === 'string'
-        ? message.content
-        : JSON.stringify(message.content ?? '');
+        ? (message.content || 'null')
+        : JSON.stringify(message.content ?? null);
       const idAttr = callId ? ` tool_call_id="${escapeAttr(callId)}"` : '';
       return {
         role: 'user',
@@ -504,5 +525,6 @@ module.exports = {
   parseToolCallsFromText,
   createToolCallStreamParser,
   createNativeToolCallAccumulator,
+  looksLikeUnexecutedToolAction,
   serializeToolArguments
 };

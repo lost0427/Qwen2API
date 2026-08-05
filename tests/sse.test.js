@@ -36,6 +36,15 @@ test('SSEDecoder dispatches the final event even without a trailing blank line',
   assert.equal(frames[0].data, '{"ok":true}')
 })
 
+test('SSEDecoder surfaces HTTP-200 bare JSON business responses', () => {
+  const decoder = new SSEDecoder()
+  const payload = '{"ret":["FAIL_SYS_USER_VALIDATE"],"success":false}'
+  assert.deepEqual(decoder.push(payload), [])
+  const frames = decoder.end()
+  assert.equal(frames.length, 1)
+  assert.equal(frames[0].data, payload)
+})
+
 test('consumeSSEStream serializes async handlers before resolving', async () => {
   const stream = new PassThrough()
   const seen = []
@@ -50,6 +59,7 @@ test('consumeSSEStream serializes async handlers before resolving', async () => 
   assert.deepEqual(seen, ['one', 'two', '[DONE]'])
   assert.equal(result.sawDone, true)
   assert.equal(result.eventCount, 3)
+  assert.equal(result.completed, true)
 })
 
 test('formatSSEFrame produces a frame that survives byte-by-byte decoding', async () => {
