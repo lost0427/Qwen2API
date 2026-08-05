@@ -13,6 +13,34 @@ const TOOL_CALL_OPEN = '<tool_call>';
  */
 const TOOL_CALL_CLOSE = '</tool_call>';
 
+const normalizeAllowedToolNames = (allowedToolNames) => {
+  if (!allowedToolNames) return null;
+  const names = allowedToolNames instanceof Set ? allowedToolNames : new Set(allowedToolNames);
+  return names.size > 0 ? names : null;
+};
+
+const serializeToolArguments = (args) => {
+  if (typeof args === 'string') {
+    try {
+      JSON.parse(args);
+      return args;
+    } catch (_) {
+      return JSON.stringify(args);
+    }
+  }
+  return JSON.stringify(args ?? {});
+};
+
+const createToolCallObject = (payload, index = 0, id = null) => ({
+  index,
+  id: id || `call_${generateUUID().replace(/-/g, '').slice(0, 24)}`,
+  type: 'function',
+  function: {
+    name: payload.name,
+    arguments: serializeToolArguments(payload.arguments)
+  }
+});
+
 /**
  * 将 JSON Schema 类型压缩为简短 TypeScript 风格签名
  * @param {Object} schema - JSON Schema 节点
@@ -226,31 +254,47 @@ const parseToolCallPayload = (raw) => {
 /**
  * 从完整文本中提取所有工具调用块
  * @param {string} fullText - 模型完整输出
- * @returns {{ cleanedText: string, toolCalls: Array<Object> }} 抽取结果
+ * @param {Object} [options]
+ * @param {Set<string>|Array<string>} [options.allowedToolNames]
+ * @returns {{ cleanedText: string, toolCalls: Array<Object>, errors: Array<Object> }} 抽取结果
  */
-const parseToolCallsFromText = (fullText) => {
+const parseToolCallsFromText = (fullText, options = {}) => {
   if (typeof fullText !== 'string' || !fullText.includes(TOOL_CALL_OPEN)) {
-    return { cleanedText: fullText || '', toolCalls: [] };
+    return { cleanedText: fullText || '', toolCalls: [], errors: [] };
   }
 
+  const allowedToolNames = normalizeAllowedToolNames(options.allowedToolNames);
   const toolCalls = [];
+  const errors = [];
   const pattern = /<tool_call>([\s\S]*?)<\/tool_call>/g;
   const cleanedText = fullText.replace(pattern, (_, inner) => {
     const payload = parseToolCallPayload(inner);
-    if (payload) {
-      toolCalls.push({
-        id: `call_${generateUUID().replace(/-/g, '').slice(0, 24)}`,
-        type: 'function',
-        function: {
-          name: payload.name,
-          arguments: JSON.stringify(payload.arguments ?? {})
-        }
-      });
+    if (!payload) {
+      errors.push({ type: 'invalid_json', raw: inner });
+    } else if (allowedToolNames && !allowedToolNames.has(payload.name)) {
+      errors.push({ type: 'unknown_tool', name: payload.name });
+    } else {
+      toolCalls.push(createToolCallObject(payload, toolCalls.length));
     }
     return '';
   });
 
-  return { cleanedText: cleanedText.trim(), toolCalls };
+  const unclosedIndex = cleanedText.indexOf(TOOL_CALL_OPEN);
+  let finalText = cleanedText;
+  if (unclosedIndex !== -1) {
+    const raw = cleanedText.slice(unclosedIndex + TOOL_CALL_OPEN.length);
+    const payload = parseToolCallPayload(raw);
+    if (!payload) {
+      errors.push({ type: 'truncated_tool_call', raw });
+    } else if (allowedToolNames && !allowedToolNames.has(payload.name)) {
+      errors.push({ type: 'unknown_tool', name: payload.name });
+    } else {
+      toolCalls.push(createToolCallObject(payload, toolCalls.length));
+    }
+    finalText = cleanedText.slice(0, unclosedIndex);
+  }
+
+  return { cleanedText: finalText.trim(), toolCalls, errors };
 };
 
 /**
@@ -264,11 +308,26 @@ const parseToolCallsFromText = (fullText) => {
  *   hasEmittedAnyCall: () => boolean
  * }} 解析器实例
  */
-const createToolCallStreamParser = () => {
+const createToolCallStreamParser = (options = {}) => {
+  const allowedToolNames = normalizeAllowedToolNames(options.allowedToolNames);
   let pendingText = '';
   let inToolCall = false;
   let toolCallBuffer = '';
   let emittedCallCount = 0;
+  const errors = [];
+
+  const acceptPayload = (payload, raw, result) => {
+    if (!payload) {
+      errors.push({ type: 'invalid_json', raw });
+      return;
+    }
+    if (allowedToolNames && !allowedToolNames.has(payload.name)) {
+      errors.push({ type: 'unknown_tool', name: payload.name });
+      return;
+    }
+    result.completedCalls.push(createToolCallObject(payload, emittedCallCount));
+    emittedCallCount += 1;
+  };
 
   /**
    * 在等待标签出现时，安全地输出已确定不是标签前缀的部分
@@ -308,18 +367,7 @@ const createToolCallStreamParser = () => {
         buffer = toolCallBuffer.slice(closeIdx + TOOL_CALL_CLOSE.length);
         toolCallBuffer = '';
         const payload = parseToolCallPayload(inner);
-        if (payload) {
-          result.completedCalls.push({
-            index: emittedCallCount,
-            id: `call_${generateUUID().replace(/-/g, '').slice(0, 24)}`,
-            type: 'function',
-            function: {
-              name: payload.name,
-              arguments: JSON.stringify(payload.arguments ?? {})
-            }
-          });
-          emittedCallCount += 1;
-        }
+        acceptPayload(payload, inner, result);
         inToolCall = false;
         continue;
       }
@@ -350,18 +398,7 @@ const createToolCallStreamParser = () => {
     const result = { textDelta: '', completedCalls: [] };
     if (inToolCall && toolCallBuffer) {
       const payload = parseToolCallPayload(toolCallBuffer);
-      if (payload) {
-        result.completedCalls.push({
-          index: emittedCallCount,
-          id: `call_${generateUUID().replace(/-/g, '').slice(0, 24)}`,
-          type: 'function',
-          function: {
-            name: payload.name,
-            arguments: JSON.stringify(payload.arguments ?? {})
-          }
-        });
-        emittedCallCount += 1;
-      }
+      acceptPayload(payload, toolCallBuffer, result);
       toolCallBuffer = '';
       inToolCall = false;
     }
@@ -376,7 +413,86 @@ const createToolCallStreamParser = () => {
     push,
     flush,
     hasPendingCall: () => inToolCall,
-    hasEmittedAnyCall: () => emittedCallCount > 0
+    hasEmittedAnyCall: () => emittedCallCount > 0,
+    hasParseError: () => errors.length > 0,
+    getErrors: () => [...errors]
+  };
+};
+
+/**
+ * 累积 OpenAI 原生 delta.tool_calls。网页上游一旦开始原生返回工具调用，桥接层无需再依赖 XML。
+ */
+const createNativeToolCallAccumulator = (options = {}) => {
+  const allowedToolNames = normalizeAllowedToolNames(options.allowedToolNames);
+  const calls = new Map();
+  const errors = [];
+
+  const push = (deltas) => {
+    if (!Array.isArray(deltas)) return;
+    for (const delta of deltas) {
+      if (!delta || typeof delta !== 'object') continue;
+      const index = Number.isInteger(delta.index) ? delta.index : calls.size;
+      const current = calls.get(index) || {
+        index,
+        id: delta.id || null,
+        type: delta.type || 'function',
+        function: { name: '', arguments: '' }
+      };
+      if (delta.id) current.id = delta.id;
+      if (delta.type) current.type = delta.type;
+      if (typeof delta.function?.name === 'string' && delta.function.name) {
+        const incomingName = delta.function.name;
+        if (!current.function.name) {
+          current.function.name = incomingName;
+        } else if (incomingName === current.function.name || current.function.name.endsWith(incomingName)) {
+          // 某些兼容上游会在每个 delta 重复完整 name，不能重复拼接。
+        } else if (incomingName.startsWith(current.function.name)) {
+          current.function.name = incomingName;
+        } else {
+          current.function.name += incomingName;
+        }
+      }
+      if (typeof delta.function?.arguments === 'string') current.function.arguments += delta.function.arguments;
+      calls.set(index, current);
+    }
+  };
+
+  const finalize = () => {
+    const finalized = [];
+    for (const [index, call] of [...calls.entries()].sort((a, b) => a[0] - b[0])) {
+      if (!call.function.name) {
+        errors.push({ type: 'missing_tool_name', index });
+        continue;
+      }
+      if (allowedToolNames && !allowedToolNames.has(call.function.name)) {
+        errors.push({ type: 'unknown_tool', name: call.function.name });
+        continue;
+      }
+      try {
+        JSON.parse(call.function.arguments || '{}');
+      } catch (_) {
+        errors.push({ type: 'invalid_arguments', name: call.function.name });
+        continue;
+      }
+      finalized.push({
+        index: finalized.length,
+        id: call.id || `call_${generateUUID().replace(/-/g, '').slice(0, 24)}`,
+        type: 'function',
+        function: {
+          name: call.function.name,
+          arguments: call.function.arguments || '{}'
+        }
+      });
+    }
+    return finalized;
+  };
+
+  return {
+    push,
+    finalize,
+    hasAny: () => calls.size > 0,
+    hasParseError: () => errors.length > 0,
+    getErrors: () => [...errors]
   };
 };
 
@@ -386,5 +502,7 @@ module.exports = {
   buildToolSystemPrompt,
   foldToolMessages,
   parseToolCallsFromText,
-  createToolCallStreamParser
+  createToolCallStreamParser,
+  createNativeToolCallAccumulator,
+  serializeToolArguments
 };
