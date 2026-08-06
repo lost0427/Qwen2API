@@ -5,7 +5,8 @@ const { PassThrough, Readable } = require('node:stream')
 const {
   SSEDecoder,
   consumeSSEStream,
-  formatSSEFrame
+  formatSSEFrame,
+  createUpstreamResponseFilter
 } = require('../src/utils/sse.js')
 
 test('SSEDecoder handles arbitrary TCP, UTF-8 and CRLF boundaries', () => {
@@ -71,4 +72,42 @@ test('formatSSEFrame produces a frame that survives byte-by-byte decoding', asyn
   assert.equal(frames[0].event, 'message')
   assert.equal(frames[0].id, '42')
   assert.equal(frames[0].data, '第一行\n第二行')
+})
+
+// 上游偶尔对同一次请求开启多路候选回答，两路帧交错到达；
+// 帧样本取自 chat.qwen.ai 实际抓包（问题 #149，回答被复读成 "巴黎巴黎"）。
+const DUAL_RESPONSE_FRAMES = [
+  '{"response.created":{"chat_id":"d8e2ce75","parent_id":"4cc3a56d","response_id":"4f79335b","response_index":"0"}}',
+  '{"response.created":{"chat_id":"d8e2ce75","parent_id":"4cc3a56d","response_id":"4c2b7c86","response_index":"1"}}',
+  '{"choices":[{"delta":{"role":"assistant","content":"巴","phase":"answer","status":"typing"}}],"response_id":"4c2b7c86"}',
+  '{"choices":[{"delta":{"role":"assistant","content":"巴","phase":"answer","status":"typing"}}],"response_id":"4f79335b"}',
+  '{"choices":[{"delta":{"role":"assistant","content":"黎","phase":"answer","status":"typing"}}],"response_id":"4c2b7c86"}',
+  '{"choices":[{"delta":{"content":"","role":"assistant","status":"finished","phase":"answer"}}],"response_id":"4c2b7c86"}',
+  '{"choices":[{"delta":{"role":"assistant","content":"黎","phase":"answer","status":"typing"}}],"response_id":"4f79335b"}',
+  '{"choices":[{"delta":{"content":"","role":"assistant","status":"finished","phase":"answer"}}],"response_id":"4f79335b"}'
+]
+
+const collectAnswer = (rawFrames, accept) => {
+  let answer = ''
+  for (const raw of rawFrames) {
+    const json = JSON.parse(raw)
+    if (accept && !accept(json)) continue
+    if (!json.choices || json.choices.length === 0) continue
+    answer += json.choices[0].delta?.content || ''
+  }
+  return answer
+}
+
+test('createUpstreamResponseFilter keeps a single response when upstream opens several', () => {
+  // 不过滤时两路内容被拼在一起 —— 这正是 #149 的复读现象
+  assert.equal(collectAnswer(DUAL_RESPONSE_FRAMES, null), '巴巴黎黎')
+  assert.equal(collectAnswer(DUAL_RESPONSE_FRAMES, createUpstreamResponseFilter()), '巴黎')
+})
+
+test('createUpstreamResponseFilter passes frames through when upstream sends no response_id', () => {
+  const legacyFrames = [
+    '{"choices":[{"delta":{"role":"assistant","content":"巴","phase":"answer"}}]}',
+    '{"choices":[{"delta":{"role":"assistant","content":"黎","phase":"answer"}}]}'
+  ]
+  assert.equal(collectAnswer(legacyFrames, createUpstreamResponseFilter()), '巴黎')
 })
