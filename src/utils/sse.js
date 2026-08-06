@@ -39,7 +39,20 @@ const parseSSEFrame = (rawFrame) => {
         }
     }
 
-    if (!hasField) return null
+    if (!hasField) {
+        // Qwen 的 WAF/业务失败偶尔以 HTTP 200 + 裸 JSON 返回，而不是 SSE data 字段。
+        // 将完整 JSON 作为一个 data frame 交给上层分类，避免被当成“0 个事件的正常 EOF”。
+        const trimmed = rawFrame.trim()
+        if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+            try {
+                JSON.parse(trimmed)
+                return { event: null, data: trimmed, id: null, retry: null, raw: rawFrame }
+            } catch (_) {
+                // 非完整 JSON 继续按无效 SSE 忽略。
+            }
+        }
+        return null
+    }
     return { event, data: dataLines.join('\n'), id, retry, raw: rawFrame }
 }
 
@@ -119,7 +132,10 @@ const formatSSEFrame = (frame = {}) => {
  * 串行消费 Node readable 中的 SSE。for-await 会等待 onFrame，避免 end 事件越过异步 data handler。
  * @param {AsyncIterable<Buffer|string>} stream
  * @param {(frame: ReturnType<typeof parseSSEFrame>) => Promise<void>|void} onFrame
- * @returns {Promise<{sawDone: boolean, eventCount: number}>}
+ * 正常迭代结束代表 HTTP 响应体被完整消费。真正的连接重置、premature close
+ * 或解压失败会由 for-await 抛出，不能把“没有 [DONE]”等同于传输中断：
+ * Qwen 网页端的正常流本来就可能以干净 EOF 收尾。
+ * @returns {Promise<{sawDone: boolean, eventCount: number, completed: boolean}>}
  */
 const consumeSSEStream = async (stream, onFrame) => {
     if (!stream || typeof stream[Symbol.asyncIterator] !== 'function') {
@@ -143,7 +159,7 @@ const consumeSSEStream = async (stream, onFrame) => {
     }
     await consumeFrames(decoder.end())
 
-    return { sawDone, eventCount }
+    return { sawDone, eventCount, completed: true }
 }
 
 module.exports = {

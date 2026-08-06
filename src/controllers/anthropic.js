@@ -8,22 +8,24 @@ const {
   foldToolMessages,
   parseToolCallsFromText,
   createToolCallStreamParser,
-  createNativeToolCallAccumulator
+  createNativeToolCallAccumulator,
+  looksLikeUnexecutedToolAction
 } = require('../utils/tool-prompt.js');
 const { consumeSSEStream } = require('../utils/sse.js');
 const { logger } = require('../utils/logger');
+const { assertNoUpstreamFailure } = require('../utils/upstream-error.js');
 const {
   analyzeAnthropicCompatibility,
   buildAnthropicCompatibilityHeaders
 } = require('./anthropic.compatibility.js');
 
-const mapAnthropicStopReason = (upstreamReason, hasToolCalls, sawDone) => {
+const mapAnthropicStopReason = (upstreamReason, hasToolCalls, upstreamCompleted) => {
   if (hasToolCalls) return 'tool_use';
   if (upstreamReason === 'length' || upstreamReason === 'max_tokens') return 'max_tokens';
   if (upstreamReason === 'stop_sequence') return 'stop_sequence';
   if (upstreamReason === 'content_filter' || upstreamReason === 'refusal') return 'refusal';
   if (upstreamReason === 'stop' || upstreamReason === 'end_turn') return 'end_turn';
-  if (!upstreamReason && sawDone) return 'end_turn';
+  if (!upstreamReason && upstreamCompleted) return 'end_turn';
   return null;
 };
 
@@ -331,6 +333,18 @@ const buildRetryHint = (toolChoice) => {
   return 'You did not call any tool. You MUST now call exactly one tool using the <tool_call>...</tool_call> format.';
 };
 
+const buildEmptyOutputRetryHint = () => [
+  'Your previous reply produced no visible final answer or executable tool call.',
+  'Continue the Agent task now. If any action remains, emit the required `<tool_call>` block immediately with no preamble.',
+  'Only give a normal final answer when the task is actually complete; do not repeat hidden reasoning.'
+].join(' ');
+
+const buildMissingToolRetryHint = () => [
+  'Your previous reply described an action but did not execute any tool call.',
+  'Perform that action now by emitting the real `<tool_call>` block immediately with no preamble.',
+  'Do not describe the action again or claim completion without a tool result.'
+].join(' ');
+
 /**
  * 异步迭代上游 axios 流，按 SSE 段切分回调内部 delta JSON
  * @param {object} upstream - axios stream 响应
@@ -341,7 +355,9 @@ const consumeUpstream = async (upstream, onDelta) => consumeSSEStream(upstream, 
   const payload = frame.data;
   if (!payload || payload.trim() === '[DONE]') return;
   if (!isJson(payload)) return;
-  await onDelta(JSON.parse(payload));
+  const parsed = JSON.parse(payload);
+  assertNoUpstreamFailure(parsed);
+  await onDelta(parsed);
 });
 
 /**
@@ -381,7 +397,10 @@ const writeAnthropicEvent = (res, event, data) => {
  * @returns {Promise<void>} 完成 Promise
  */
 const handleAnthropicStream = async (res, ctx, upstream) => {
-  const { message_id, model, hasTools, toolChoice, requestBody, allowedToolNames = [] } = ctx;
+  const {
+    message_id, model, hasTools, toolChoice, requestBody, allowedToolNames = [],
+    sendRequest = sendChatRequest
+  } = ctx;
 
   res.set({
     'Content-Type': 'text/event-stream',
@@ -411,8 +430,9 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   let promptTokens = 0;
   let completionTokens = 0;
   let upstreamFinishReason = null;
-  let upstreamSawDone = false;
+  let upstreamCompleted = false;
   let upstreamEventCount = 0;
+  let visibleText = '';
 
   const parser = hasTools ? createToolCallStreamParser({ allowedToolNames }) : null;
   const nativeToolAccumulator = hasTools
@@ -475,6 +495,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
    */
   const emitTextDelta = (text) => {
     if (!text) return;
+    visibleText += text;
     if (!textBlockOpen) {
       closeThinkingBlockIfOpen();
       blockIndex += 1;
@@ -575,28 +596,51 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   };
 
   const initialStreamResult = await consumeUpstream(upstream, onUpstreamDelta);
-  upstreamSawDone = initialStreamResult.sawDone;
+  upstreamCompleted = initialStreamResult.completed;
   upstreamEventCount = initialStreamResult.eventCount;
 
-  // required 重试
-  if (
-    parser &&
-    !parser.hasEmittedAnyCall() &&
+  // required 与“只有思考、没有正文/工具调用”共用一次 Agent 补偿重试。
+  const needsRequiredRetry = !!(
+    parser && !parser.hasEmittedAnyCall() &&
+    !nativeToolAccumulator?.hasAny() && requiresToolCall(toolChoice)
+  );
+  const needsEmptyOutputRetry = !!(
+    !visibleText.trim() && !parser?.hasEmittedAnyCall() && !parser?.hasPendingCall() &&
+    !parser?.hasParseError() && !nativeToolAccumulator?.hasAny() &&
+    !['length', 'max_tokens', 'content_filter', 'refusal'].includes(upstreamFinishReason)
+  );
+  const needsMissingToolRetry = !!(
+    hasTools && looksLikeUnexecutedToolAction(visibleText) &&
+    !parser?.hasEmittedAnyCall() && !parser?.hasPendingCall() && !parser?.hasParseError() &&
     !nativeToolAccumulator?.hasAny() &&
-    requiresToolCall(toolChoice)
-  ) {
-    const retryBody = appendRetryHint(requestBody, buildRetryHint(toolChoice));
-    logger.warning?.('Anthropic 流式: tool_choice=required 首次未触发，重试一次', 'ANTHROPIC');
+    !['length', 'max_tokens', 'content_filter', 'refusal'].includes(upstreamFinishReason)
+  );
+  if (needsRequiredRetry || needsEmptyOutputRetry || needsMissingToolRetry) {
+    const retryBody = appendRetryHint(
+      requestBody,
+      needsRequiredRetry
+        ? buildRetryHint(toolChoice)
+        : (needsMissingToolRetry ? buildMissingToolRetryHint() : buildEmptyOutputRetryHint())
+    );
+    logger.warning?.(
+      needsRequiredRetry
+        ? 'Anthropic 流式: tool_choice=required 首次未触发，重试一次'
+        : (needsMissingToolRetry
+          ? 'Anthropic Agent 首次响应只描述了动作但未调用工具，补偿重试一次'
+          : 'Anthropic Agent 首次响应没有正文或工具调用，补偿重试一次'),
+      'ANTHROPIC'
+    );
     try {
-      const retryResp = await sendChatRequest(retryBody);
+      const retryResp = await sendRequest(retryBody);
       if (retryResp.status && retryResp.response) {
         upstreamFinishReason = null;
         const retryResult = await consumeUpstream(retryResp.response, onUpstreamDelta);
-        upstreamSawDone = retryResult.sawDone;
+        upstreamCompleted = retryResult.completed;
         upstreamEventCount = retryResult.eventCount;
       }
     } catch (e) {
       logger.error('Anthropic 流式重试失败', 'ANTHROPIC', '', e);
+      if (e.publicMessage) throw e;
     }
   }
 
@@ -629,13 +673,21 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     return;
   }
 
+  if (!visibleText.trim() && !hasEmittedToolCalls &&
+      !['length', 'max_tokens', 'content_filter', 'refusal'].includes(upstreamFinishReason)) {
+    closeThinkingBlockIfOpen();
+    closeTextBlockIfOpen();
+    writeAnthropicError(res, '上游重试后仍未返回正文或工具调用', 'api_error');
+    return;
+  }
+
   closeThinkingBlockIfOpen();
   closeTextBlockIfOpen();
 
   const stopReason = mapAnthropicStopReason(
     upstreamFinishReason,
     hasEmittedToolCalls,
-    upstreamSawDone
+    upstreamCompleted
   );
   if (!stopReason) {
     const detail = upstreamEventCount === 0 ? '上游未返回任何 SSE 事件' : '上游流在结束标记前断开';
@@ -669,7 +721,10 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
  * @returns {Promise<void>} 完成 Promise
  */
 const handleAnthropicNonStream = async (res, ctx, upstream) => {
-  const { message_id, model, hasTools, toolChoice, requestBody, allowedToolNames = [] } = ctx;
+  const {
+    message_id, model, hasTools, toolChoice, requestBody, allowedToolNames = [],
+    sendRequest = sendChatRequest
+  } = ctx;
 
   let thinkingContent = '';
   let answerContent = '';
@@ -677,7 +732,7 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
   let completionTokens = 0;
   let webSearchInfo = null;
   let upstreamFinishReason = null;
-  let upstreamSawDone = false;
+  let upstreamCompleted = false;
   let upstreamEventCount = 0;
   let nativeToolAccumulator = hasTools
     ? createNativeToolCallAccumulator({ allowedToolNames })
@@ -720,10 +775,10 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
   };
 
   const initialStreamResult = await consumeUpstream(upstream, onUpstreamDelta);
-  upstreamSawDone = initialStreamResult.sawDone;
+  upstreamCompleted = initialStreamResult.completed;
   upstreamEventCount = initialStreamResult.eventCount;
 
-  if (!upstreamSawDone && !upstreamFinishReason) {
+  if (!upstreamCompleted && !upstreamFinishReason) {
     const detail = upstreamEventCount === 0 ? '上游未返回任何 SSE 事件' : '上游流在结束标记前断开';
     return res.status(502).json({
       type: 'error',
@@ -757,19 +812,37 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     ...(nativeToolAccumulator?.getErrors() || [])
   ];
 
-  // required 重试
-  if (hasTools && toolCalls.length === 0 && requiresToolCall(toolChoice)) {
-    logger.warning?.('Anthropic 非流式: tool_choice=required 首次未触发，重试一次', 'ANTHROPIC');
+  // required 与空可见输出共用一次 Agent 补偿重试。
+  const needsRequiredRetry = hasTools && toolCalls.length === 0 && requiresToolCall(toolChoice);
+  const needsEmptyOutputRetry = toolCalls.length === 0 && toolErrors.length === 0 && !cleanedText.trim() &&
+    !['length', 'max_tokens', 'content_filter', 'refusal'].includes(upstreamFinishReason);
+  const needsMissingToolRetry = hasTools && toolCalls.length === 0 && toolErrors.length === 0 &&
+    looksLikeUnexecutedToolAction(cleanedText) &&
+    !['length', 'max_tokens', 'content_filter', 'refusal'].includes(upstreamFinishReason);
+  if (needsRequiredRetry || needsEmptyOutputRetry || needsMissingToolRetry) {
+    logger.warning?.(
+      needsRequiredRetry
+        ? 'Anthropic 非流式: tool_choice=required 首次未触发，重试一次'
+        : (needsMissingToolRetry
+          ? 'Anthropic Agent 首次响应只描述了动作但未调用工具，补偿重试一次'
+          : 'Anthropic Agent 首次响应没有正文或工具调用，补偿重试一次'),
+      'ANTHROPIC'
+    );
     try {
-      const retryResp = await sendChatRequest(appendRetryHint(requestBody, buildRetryHint(toolChoice)));
+      const retryResp = await sendRequest(appendRetryHint(
+        requestBody,
+        needsRequiredRetry
+          ? buildRetryHint(toolChoice)
+          : (needsMissingToolRetry ? buildMissingToolRetryHint() : buildEmptyOutputRetryHint())
+      ));
       if (retryResp.status && retryResp.response) {
         const before = answerContent;
         nativeToolAccumulator = createNativeToolCallAccumulator({ allowedToolNames });
         upstreamFinishReason = null;
         const retryResult = await consumeUpstream(retryResp.response, onUpstreamDelta);
-        upstreamSawDone = retryResult.sawDone;
+        upstreamCompleted = retryResult.completed;
         upstreamEventCount = retryResult.eventCount;
-        if (!upstreamSawDone && !upstreamFinishReason) {
+        if (!upstreamCompleted && !upstreamFinishReason) {
           return res.status(502).json({
             type: 'error',
             error: { type: 'api_error', message: '工具调用重试流在结束标记前断开' }
@@ -787,6 +860,7 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
       }
     } catch (e) {
       logger.error('Anthropic 非流式重试失败', 'ANTHROPIC', '', e);
+      if (e.publicMessage) throw e;
     }
   }
 
@@ -800,10 +874,18 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     });
   }
 
+  if (toolCalls.length === 0 && !cleanedText.trim() &&
+      !['length', 'max_tokens', 'content_filter', 'refusal'].includes(upstreamFinishReason)) {
+    return res.status(502).json({
+      type: 'error',
+      error: { type: 'api_error', message: '上游重试后仍未返回正文或工具调用' }
+    });
+  }
+
   const stopReason = mapAnthropicStopReason(
     upstreamFinishReason,
     toolCalls.length > 0,
-    upstreamSawDone
+    upstreamCompleted
   );
   if (!stopReason) {
     return res.status(502).json({
@@ -905,11 +987,11 @@ const handleAnthropicMessages = async (req, res) => {
     if (!res.headersSent) {
       res.status(500).json({
         type: 'error',
-        error: { type: 'api_error', message: 'Service error' }
+        error: { type: 'api_error', message: error.publicMessage || 'Service error' }
       });
     } else {
       if (!res.writableEnded) {
-        try { writeAnthropicError(res, '上游响应处理失败', 'api_error'); } catch (_) { /* ignore */ }
+        try { writeAnthropicError(res, error.publicMessage || '上游响应处理失败', 'api_error'); } catch (_) { /* ignore */ }
       }
     }
   }

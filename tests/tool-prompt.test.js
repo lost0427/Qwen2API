@@ -2,10 +2,42 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 
 const {
+  buildToolSystemPrompt,
+  foldToolMessages,
+  looksLikeUnexecutedToolAction,
   parseToolCallsFromText,
   createToolCallStreamParser,
   createNativeToolCallAccumulator
 } = require('../src/utils/tool-prompt.js')
+
+test('Agent tool prompt forbids prose-only actions and premature completion', () => {
+  const prompt = buildToolSystemPrompt([{
+    type: 'function',
+    function: {
+      name: 'write_file',
+      description: 'Write a file',
+      parameters: {
+        type: 'object',
+        properties: { path: { type: 'string', description: 'Target path' } },
+        required: ['path']
+      }
+    }
+  }])
+  assert.match(prompt, /MUST be a `<tool_call>` block/)
+  assert.match(prompt, /Only return a normal-language final answer after the requested task is genuinely complete/)
+  assert.match(prompt, /path: string \/\* Target path \*\//)
+  assert.equal(looksLikeUnexecutedToolAction('I will inspect the repository now.'), true)
+  assert.equal(looksLikeUnexecutedToolAction('我将运行测试并检查结果。'), true)
+  assert.equal(looksLikeUnexecutedToolAction('这里是无需调用工具的概念解释。'), false)
+})
+
+test('empty tool results remain visible in Agent history', () => {
+  const folded = foldToolMessages([
+    { role: 'assistant', content: '', tool_calls: [{ id: 'call_1', function: { name: 'read_file', arguments: '{}' } }] },
+    { role: 'tool', tool_call_id: 'call_1', content: '' }
+  ])
+  assert.match(folded[1].content, />\nnull\n<\/tool_response>/)
+})
 
 test('stream parser accepts split valid calls and preserves JSON string arguments', () => {
   const parser = createToolCallStreamParser({ allowedToolNames: ['read_file'] })
