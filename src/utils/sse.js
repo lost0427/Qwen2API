@@ -162,9 +162,31 @@ const consumeSSEStream = async (stream, onFrame) => {
     return { sawDone, eventCount, completed: true }
 }
 
+/**
+ * 创建上游并发响应过滤器。
+ * 上游偶尔会对同一次请求开启多路候选回答：先连续下发多个 response.created
+ * （chat_id/parent_id 相同，response_index 为 "0"/"1"，各自 response_id 不同），
+ * 随后两路增量帧交错到达。解析时不区分 response_id 就会把两路内容拼到一起，
+ * 回答被复读（"巴黎巴黎"）。这里锁定第一个带 response_id 的帧，丢弃其余各路。
+ * 上游未带 response_id 时（旧协议）一律放行。
+ * @returns {(json: object) => boolean} true 表示该帧属于已锁定的那一路，应继续处理
+ */
+const createUpstreamResponseFilter = () => {
+    let acceptedId = null
+    return (json) => {
+        const responseId = json && json.response_id
+        if (!responseId) return true
+        if (acceptedId === null) {
+            acceptedId = responseId
+        }
+        return responseId === acceptedId
+    }
+}
+
 module.exports = {
     SSEDecoder,
     parseSSEFrame,
     formatSSEFrame,
-    consumeSSEStream
+    consumeSSEStream,
+    createUpstreamResponseFilter
 }

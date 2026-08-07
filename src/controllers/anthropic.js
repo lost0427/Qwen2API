@@ -11,7 +11,7 @@ const {
   createNativeToolCallAccumulator,
   looksLikeUnexecutedToolAction
 } = require('../utils/tool-prompt.js');
-const { consumeSSEStream } = require('../utils/sse.js');
+const { consumeSSEStream, createUpstreamResponseFilter } = require('../utils/sse.js');
 const { logger } = require('../utils/logger');
 const { assertNoUpstreamFailure } = require('../utils/upstream-error.js');
 const {
@@ -541,12 +541,15 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   let webSearchInfo = null;
   let thinkingStarted = false;
   const normalizeDelta = createUpstreamDeltaNormalizer();
+  const acceptUpstreamFrame = createUpstreamResponseFilter();
 
   /**
    * 处理一个上游 delta JSON
    * @param {Object} json - 上游 SSE delta
    */
   const onUpstreamDelta = async (json) => {
+    // 丢弃其余候选回答的帧：上游多路并发会让内容重复
+    if (!acceptUpstreamFrame(json)) return;
     if (json.usage) {
       promptTokens = json.usage.prompt_tokens || promptTokens;
       completionTokens = json.usage.completion_tokens || completionTokens;
@@ -738,12 +741,15 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     ? createNativeToolCallAccumulator({ allowedToolNames })
     : null;
   const normalizeDelta = createUpstreamDeltaNormalizer();
+  const acceptUpstreamFrame = createUpstreamResponseFilter();
 
   /**
    * 处理一个上游 delta JSON
    * @param {Object} json - 上游 SSE delta
    */
   const onUpstreamDelta = async (json) => {
+    // 丢弃其余候选回答的帧：上游多路并发会让内容重复
+    if (!acceptUpstreamFrame(json)) return;
     if (json.usage) {
       promptTokens = json.usage.prompt_tokens || promptTokens;
       completionTokens = json.usage.completion_tokens || completionTokens;

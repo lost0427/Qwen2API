@@ -457,3 +457,37 @@ test('non-stream responses preserve truncation for both protocols', async () => 
   )
   assert.match(anthropicRes.output, /"stop_reason":"max_tokens"/)
 })
+
+test('interleaved multi-response frames are not merged into a duplicated answer', async () => {
+  // 上游偶尔对同一次请求开启多路候选回答：先下发两个 response.created
+  // （response_index "0"/"1"，各自 response_id 不同），随后两路增量帧交错到达。
+  // 不按 response_id 区分就会把两路内容拼在一起，回答被复读（问题 #149）。
+  // 下列帧取自 chat.qwen.ai 实际抓包。
+  const dualResponseFrames = [
+    'data: {"response.created":{"chat_id":"d8e2ce75","parent_id":"4cc3a56d","response_id":"4f79335b","response_index":"0"}}\n\n',
+    'data: {"response.created":{"chat_id":"d8e2ce75","parent_id":"4cc3a56d","response_id":"4c2b7c86","response_index":"1"}}\n\n',
+    'data: {"choices":[{"delta":{"role":"assistant","content":"巴","phase":"answer","status":"typing"}}],"response_id":"4c2b7c86"}\n\n',
+    'data: {"choices":[{"delta":{"role":"assistant","content":"巴","phase":"answer","status":"typing"}}],"response_id":"4f79335b"}\n\n',
+    'data: {"choices":[{"delta":{"role":"assistant","content":"黎","phase":"answer","status":"typing"}}],"response_id":"4c2b7c86"}\n\n',
+    'data: {"choices":[{"delta":{"content":"","role":"assistant","status":"finished","phase":"answer"}}],"response_id":"4c2b7c86"}\n\n',
+    'data: {"choices":[{"delta":{"role":"assistant","content":"黎","phase":"answer","status":"typing"}}],"response_id":"4f79335b"}\n\n',
+    'data: {"choices":[{"delta":{"content":"","role":"assistant","status":"finished","phase":"answer"}}],"response_id":"4f79335b"}\n\n',
+    'data: [DONE]\n\n'
+  ]
+
+  const readAnswer = (output) => output
+    .split('\n\n')
+    .map(frame => frame.replace(/^data: /, '').trim())
+    .filter(frame => frame && frame !== '[DONE]')
+    .map(frame => JSON.parse(frame))
+    .map(json => json.choices?.[0]?.delta?.content || '')
+    .join('')
+
+  const streamRes = createMockResponse()
+  await handleStreamResponse(streamRes, Readable.from(dualResponseFrames), false, false, { messages: [] }, {})
+  assert.equal(readAnswer(streamRes.output), '巴黎')
+
+  const nonStreamRes = createMockResponse()
+  await handleNonStreamResponse(nonStreamRes, Readable.from(dualResponseFrames), false, false, { messages: [] }, {})
+  assert.equal(JSON.parse(nonStreamRes.output).choices[0].message.content, '巴黎')
+})

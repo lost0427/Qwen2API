@@ -7,7 +7,7 @@ const {
     createNativeToolCallAccumulator,
     looksLikeUnexecutedToolAction
 } = require('../utils/tool-prompt.js')
-const { consumeSSEStream } = require('../utils/sse.js')
+const { consumeSSEStream, createUpstreamResponseFilter } = require('../utils/sse.js')
 const accountManager = require('../utils/account.js')
 const config = require('../config/index.js')
 const { logger } = require('../utils/logger')
@@ -172,6 +172,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
         let thinking_start = false
         let thinking_end = false
         const normalizeDelta = createUpstreamDeltaNormalizer()
+        const acceptUpstreamFrame = createUpstreamResponseFilter()
         let emittedImageMarkdownSet = new Set()
         let pendingImageMarkdownList = []
 
@@ -337,6 +338,8 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
             const decodeJson = isJson(dataContent) ? JSON.parse(dataContent) : null
             if (decodeJson === null) return
             assertNoUpstreamFailure(decodeJson)
+            // 丢弃其余候选回答的帧：上游多路并发会让内容重复
+            if (!acceptUpstreamFrame(decodeJson)) return
 
             if (decodeJson.usage) {
                 totalTokens = {
@@ -661,6 +664,7 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
         let thinking_start = false
         let thinking_end = false
         const normalizeDelta = createUpstreamDeltaNormalizer()
+        const acceptUpstreamFrame = createUpstreamResponseFilter()
         let appendedImageMarkdownSet = new Set()
         let pendingImageMarkdownList = []
 
@@ -704,6 +708,8 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
             const decodeJson = isJson(dataContent) ? JSON.parse(dataContent) : null
             if (decodeJson === null) return
             assertNoUpstreamFailure(decodeJson)
+            // 丢弃其余候选回答的帧：上游多路并发会让内容重复
+            if (!acceptUpstreamFrame(decodeJson)) return
 
             if (decodeJson.usage) {
                 totalTokens = {
