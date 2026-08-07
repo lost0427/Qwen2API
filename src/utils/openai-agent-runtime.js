@@ -1,6 +1,7 @@
 const { isJson } = require('./tools.js')
 const {
   parseToolCallsFromText,
+  createToolCallStreamParser,
   createNativeToolCallAccumulator
 } = require('./tool-prompt.js')
 const { consumeSSEStream, createUpstreamResponseFilter } = require('./sse.js')
@@ -40,7 +41,8 @@ const imageMarkdownFromDelta = (delta) => {
 }
 
 /**
- * 完整消费一次 Qwen 上游 attempt，但不向客户端写任何字节。
+ * 完整消费一次 Qwen 上游 attempt。正文与工具调用始终留在门禁内；调用方可通过
+ * on_reasoning_delta 实时接收已经确认不属于 <tool_call> 的思考增量。
  * 每次调用都新建 parser/filter/accumulator，失败 attempt 不会污染下一次。
  */
 const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
@@ -51,6 +53,16 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
   const nativeTools = hasTools
     ? createNativeToolCallAccumulator({ allowedToolNames })
     : null
+  const reasoningStreamParser = typeof options.on_reasoning_delta === 'function'
+    ? createToolCallStreamParser({ allowedToolNames })
+    : null
+
+  const emitReasoningDelta = async (text) => {
+    if (typeof options.on_reasoning_delta !== 'function') return
+    await options.on_reasoning_delta(text || '', {
+      attemptNumber: Math.max(1, Number(options.attempt_number) || 1)
+    })
+  }
 
   let reasoning = ''
   let answer = ''
@@ -138,6 +150,10 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
     if (!normalized) return
     if (normalized.phase === 'think') {
       reasoning += normalized.content
+      if (reasoningStreamParser) {
+        const streamed = reasoningStreamParser.push(normalized.content)
+        await emitReasoningDelta(streamed.textDelta)
+      }
       return
     }
 
@@ -149,6 +165,11 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
     }
     answer += normalized.content
   })
+
+  if (reasoningStreamParser) {
+    const streamed = reasoningStreamParser.flush()
+    await emitReasoningDelta(streamed.textDelta)
+  }
 
   const textTools = hasTools
     ? parseToolCallsFromText(answer, { allowedToolNames })
@@ -307,7 +328,10 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
   }
 
   for (let attemptNumber = 1; attemptNumber <= maxAttempts; attemptNumber++) {
-    const attempt = await collectOpenAIAgentAttempt(currentResponse, options)
+    const attempt = await collectOpenAIAgentAttempt(currentResponse, {
+      ...options,
+      attempt_number: attemptNumber
+    })
     const evaluation = evaluateOpenAIAgentAttempt(attempt, options)
     lastAttempt = attempt
     lastEvaluation = evaluation

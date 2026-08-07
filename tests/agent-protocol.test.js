@@ -207,7 +207,7 @@ test('thinking-only Agent turns retry once and recover visible output', async ()
   assert.match(anthropicRes.output, /event: message_stop/)
 })
 
-test('strict OpenAI Agent gate keeps retry attempts isolated until a real tool call is produced', async () => {
+test('strict OpenAI Agent gate streams reasoning but keeps rejected answer attempts isolated', async () => {
   const retryOptions = []
   let retries = 0
   const res = createMockResponse()
@@ -251,7 +251,7 @@ test('strict OpenAI Agent gate keeps retry attempts isolated until a real tool c
   assert.equal(retryOptions[1].parentId, 'resp_2')
   assert.match(res.output, /"name":"read_file"/)
   assert.match(res.output, /"finish_reason":"tool_calls"/)
-  assert.doesNotMatch(res.output, /first attempt planning/)
+  assert.match(res.output, /"reasoning_content":"first attempt planning"/)
   assert.doesNotMatch(res.output, /I will inspect/)
 })
 
@@ -280,7 +280,7 @@ test('strict OpenAI Agent gate accepts only explicit verified completion and str
   assert.doesNotMatch(res.output, /agent_final/)
 })
 
-test('strict OpenAI Agent gate never turns repeated bare prose into a normal stop', async () => {
+test('strict OpenAI Agent stream returns an in-band terminal error instead of a normal stop', async () => {
   let retries = 0
   const res = createMockResponse()
   await handleStreamResponse(
@@ -305,10 +305,52 @@ test('strict OpenAI Agent gate never turns repeated bare prose into a normal sto
   )
 
   assert.equal(retries, 2)
-  assert.equal(res.statusCode, 429)
+  assert.equal(res.statusCode, 200)
+  assert.equal(res.headers['Content-Type'], 'text/event-stream')
   assert.match(res.output, /upstream_agent_turn_incomplete/)
-  assert.doesNotMatch(res.output, /\[DONE\]/)
+  assert.match(res.output, /\[DONE\]/)
   assert.doesNotMatch(res.output, /"finish_reason":"stop"/)
+})
+
+test('strict OpenAI Agent stream exposes thinking incrementally before the gated turn completes', async () => {
+  let releaseUpstream
+  let firstFrameYielded
+  const firstFrameWasYielded = new Promise(resolve => { firstFrameYielded = resolve })
+  const upstream = Readable.from((async function * () {
+    yield 'data: {"choices":[{"delta":{"phase":"think","content":"live thought"},"finish_reason":null}]}\n\n'
+    firstFrameYielded()
+    await new Promise(resolve => { releaseUpstream = resolve })
+    yield 'data: {"choices":[{"delta":{"phase":"answer","content":"<tool_call>{\\"name\\":\\"read_file\\",\\"arguments\\":{\\"path\\":\\"README.md\\"}}</tool_call>"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+  })())
+  const res = createMockResponse()
+
+  const responsePromise = handleStreamResponse(
+    res,
+    upstream,
+    true,
+    false,
+    { messages: [{ role: 'user', content: 'inspect the repository' }] },
+    {
+      has_tools: true,
+      tool_choice: 'auto',
+      allowed_tool_names: ['read_file']
+    }
+  )
+
+  await firstFrameWasYielded
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(res.headers['Content-Type'], 'text/event-stream')
+  assert.equal(res.headers['X-Accel-Buffering'], 'no')
+  assert.match(res.output, /"role":"assistant"/)
+  assert.match(res.output, /"reasoning_content":"live thought"/)
+  assert.equal(res.writableEnded, false)
+
+  releaseUpstream()
+  await responsePromise
+  assert.equal((res.output.match(/live thought/g) || []).length, 1)
+  assert.match(res.output, /"name":"read_file"/)
+  assert.match(res.output, /"finish_reason":"tool_calls"/)
+  assert.match(res.output, /\[DONE\]/)
 })
 
 test('strict OpenAI Agent gate preserves max-token termination without synthetic retries', async () => {
@@ -449,6 +491,32 @@ test('a standalone tool call emitted in the thinking phase remains executable', 
   assert.match(res.output, /"name":"read_file"/)
   assert.match(res.output, /"finish_reason":"tool_calls"/)
   assert.doesNotMatch(res.output, /<tool_call>/)
+})
+
+test('live reasoning never leaks fragmented tool markup before the Agent gate decides', async () => {
+  const res = createMockResponse()
+  await handleStreamResponse(
+    res,
+    Readable.from([
+      'data: {"choices":[{"delta":{"phase":"think","content":"checking <too"},"finish_reason":null}]}\n\n',
+      'data: {"choices":[{"delta":{"phase":"think","content":"l_call>{\\"name\\":\\"read_file\\",\\"arguments\\":{}}</tool_call>"},"finish_reason":null}]}\n\n',
+      'data: {"choices":[{"delta":{"phase":"answer","content":"<agent_final>finished safely</agent_final>"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+    ]),
+    true,
+    false,
+    { messages: [{ role: 'user', content: 'finish safely' }] },
+    {
+      has_tools: true,
+      tool_choice: 'auto',
+      allowed_tool_names: ['read_file']
+    }
+  )
+
+  assert.match(res.output, /"reasoning_content":"checking "/)
+  assert.match(res.output, /finished safely/)
+  assert.match(res.output, /"finish_reason":"stop"/)
+  assert.doesNotMatch(res.output, /<tool_call>/)
+  assert.doesNotMatch(res.output, /l_call>/)
 })
 
 test('a partially invalid multi-tool turn is rejected as a whole', async () => {

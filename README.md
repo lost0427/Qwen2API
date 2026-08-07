@@ -134,7 +134,7 @@ CACHE_MODE=default            # 图片缓存模式 (default/file)
 | `LEGACY_REASONING_IN_CONTENT` | 推理输出格式。默认 `false`=推理走独立的 `reasoning_content` 字段；`true`=旧版行为（`<think>` 并入 `content`） | `true` 或 `false` |
 | `SIMPLE_MODEL_MAP` | 简化模型映射，只返回基础模型不包含变体 | `true` 或 `false` |
 | `MODELS_CACHE_TTL` | 模型列表缓存有效期（秒），过期后下次请求自动向上游刷新；`0` 表示永不过期 | `3600` |
-| `AGENT_TURN_MAX_ATTEMPTS` | 工具请求在一次 HTTP 回合内生成有效 `tool_calls`、明确完成态或阻塞态的最大尝试数；范围 2–6，耗尽后返回显式 429/503，绝不伪装成正常 `stop` | `3` |
+| `AGENT_TURN_MAX_ATTEMPTS` | 工具请求在一次 HTTP 回合内生成有效 `tool_calls`、明确完成态或阻塞态的最大尝试数；范围 2–6，耗尽后非流式请求返回 HTTP 429/503，SSE 请求返回显式错误帧，绝不伪装成正常 `stop` | `3` |
 | `AGENT_CONTEXT_FILE_THRESHOLD_BYTES` | Agent 请求体超过此大小时，将完整工具定义和历史自动外置为 Qwen 文本文档，避免触发约 128 KiB 的 WAF 限制 | `92160`（90 KiB） |
 | `AGENT_CONTEXT_LIVE_PROMPT_BYTES` | 上下文外置后，实时请求中保留的工具协议、system/developer 指令、原始任务、最近工具进度和当前结果的最大大小 | `49152`（48 KiB） |
 | `QWEN_CHAT_PROXY_URL` | 自定义 Chat API 反代地址 | `https://your-proxy.com` |
@@ -513,9 +513,9 @@ Authorization: Bearer sk-your-api-key
 - 历史消息中的 `assistant.tool_calls` 与 `role:"tool"` 自动折叠回链，`tool_call_id` 精确关联
 - `tool_choice` 全四态：`"auto"` / `"required"` / `{type:"function",function:{name:"..."}}` / `"none"`
 - 携带工具的请求启用严格三态回合门禁：未完成必须返回真实 `tool_calls`；只有显式确认全部完成或确实阻塞时才能返回 `stop`
-- 每个上游生成尝试完全隔离；thinking-only、裸计划、裸“完成”、残缺/不存在的工具调用不会泄漏给客户端，也不会被误报为正常结束
-- 默认最多执行 3 次协议纠正（可用 `AGENT_TURN_MAX_ATTEMPTS` 配置为 2–6）；耗尽后返回真正的 HTTP 429/503，不发送伪造的 `finish_reason=stop` 或 `[DONE]`
-- 严格门禁缓冲期间使用 HTTP `102 Processing` 保活，不会提前提交 SSE 200 响应，因此长 thinking 不易被空闲超时切断，最终错误状态仍保持真实
+- 每个上游生成尝试的正文、工具调用和结束状态完全隔离；安全的 thinking 增量会实时显示，但裸计划、裸“完成”、残缺/不存在的工具调用不会被提交为正文或正常结束
+- 默认最多执行 3 次协议纠正（可用 `AGENT_TURN_MAX_ATTEMPTS` 配置为 2–6）；耗尽后非流式请求返回真正的 HTTP 429/503，已经建立的 SSE 则发送标准错误帧和 `[DONE]`，两者都不会伪造 `finish_reason=stop`
+- 流式请求立即建立真正的 SSE，实时发送 `reasoning_content`，并用 SSE 注释帧保活；非流式门禁仍使用 HTTP `102 Processing` 保活，以保留最终真实状态码
 - 协议纠正会复用同一个 Qwen `chatId`，并使用主回答（`response_index=0`）的 `response_id` 作为下一次 `parentId`，避免一次回合制造多个 `New chat`
 - thinking 通道若只包含一个完整、合法的工具调用块，也会安全转换为标准 OpenAI `tool_calls`，不会因“只有思考”而中断 Agent
 - Qwen Web 以干净 HTTP EOF 正常结束时会正确映射为 `stop` / `tool_calls`；只有连接重置等真实传输异常才返回流错误

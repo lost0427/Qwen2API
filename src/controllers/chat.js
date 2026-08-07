@@ -39,6 +39,7 @@ const writeOpenAIStreamError = (res, message, code = 'upstream_incomplete') => {
         }
     })}\n\n`)
     res.write('data: [DONE]\n\n')
+    if (typeof res.flush === 'function') res.flush()
     res.end()
 }
 
@@ -52,8 +53,9 @@ const setResponseHeaders = (res, stream) => {
         if (stream) {
             res.set({
                 'Content-Type': 'text/event-stream',
-                'Cache-Control': 'no-cache',
+                'Cache-Control': 'no-cache, no-transform',
                 'Connection': 'keep-alive',
+                'X-Accel-Buffering': 'no',
             })
         } else {
             res.set({
@@ -206,6 +208,27 @@ const runWithProcessingHeartbeat = async (res, work, intervalMs = 15000) => {
     }
 }
 
+const runWithSSEHeartbeat = async (res, work, intervalMs = 15000) => {
+    const heartbeatMs = Math.max(1, Number(intervalMs) || 15000)
+    const heartbeat = setInterval(() => {
+        if (res.writableEnded || res.destroyed) return
+        try {
+            // SSE 已经提交 200 响应后，用注释帧保活。注释不会进入 OpenAI delta，
+            // 但能阻止反代在长 thinking 或纠正 attempt 期间把连接判为空闲。
+            res.write(': qwen2api-agent-keepalive\n\n')
+            if (typeof res.flush === 'function') res.flush()
+        } catch (_) {
+            // 客户端断开会由后续流消费/写入路径统一收敛。
+        }
+    }, heartbeatMs)
+    heartbeat.unref?.()
+    try {
+        return await work()
+    } finally {
+        clearInterval(heartbeat)
+    }
+}
+
 const normalizeAgentUsage = (attempt, requestBody, completionText) => {
     let usage = { ...(attempt?.totalTokens || {}) }
     if (!usage.prompt_tokens && !usage.completion_tokens) {
@@ -244,14 +267,54 @@ const handleOpenAIAgentStream = async (
     requestBody,
     options
 ) => {
+    setResponseHeaders(res, true)
+    const messageId = generateUUID()
+    const created = Math.round(Date.now() / 1000)
+    let firstDelta = true
+    const writeDelta = (delta) => {
+        if (!delta || Object.keys(delta).length === 0) return
+        const normalizedDelta = firstDelta ? { role: 'assistant', ...delta } : delta
+        firstDelta = false
+        res.write(`data: ${JSON.stringify({
+            id: `chatcmpl-${messageId}`,
+            object: 'chat.completion.chunk',
+            created,
+            choices: [{ index: 0, delta: normalizedDelta, finish_reason: null }]
+        })}\n\n`)
+        if (typeof res.flush === 'function') res.flush()
+    }
+
+    // 立即提交标准 SSE 首帧，不能等整个上游 attempt 收完后才让客户端看到响应。
+    // 正文/工具调用仍由下方门禁缓冲；这里只开放无工具标记的思考增量。
+    if (typeof res.flushHeaders === 'function') res.flushHeaders()
+    writeDelta({ role: 'assistant' })
+
+    const liveReasoningByAttempt = new Map()
+    const onReasoningDelta = enableThinking && !config.legacyReasoningInContent
+        ? async (text, metadata = {}) => {
+            const attemptNumber = Math.max(1, Number(metadata.attemptNumber) || 1)
+            if (!liveReasoningByAttempt.has(attemptNumber)) {
+                liveReasoningByAttempt.set(attemptNumber, '')
+            }
+            if (text) {
+                liveReasoningByAttempt.set(
+                    attemptNumber,
+                    `${liveReasoningByAttempt.get(attemptNumber)}${text}`
+                )
+                writeDelta({ reasoning_content: text })
+            }
+        }
+        : null
+
     let runtime
     try {
-        runtime = await runWithProcessingHeartbeat(
+        runtime = await runWithSSEHeartbeat(
             res,
             () => runOpenAIAgentTurn(response, {
                 ...options,
                 requestBody,
-                sendChatRequest: options.sendChatRequest || sendChatRequest
+                sendChatRequest: options.sendChatRequest || sendChatRequest,
+                on_reasoning_delta: onReasoningDelta
             }),
             options.agent_processing_heartbeat_ms
         )
@@ -269,25 +332,18 @@ const handleOpenAIAgentStream = async (
         return
     }
 
-    setResponseHeaders(res, true)
-    const messageId = generateUUID()
-    const created = Math.round(Date.now() / 1000)
     const { attempt, finishReason } = runtime
     const output = await prepareAgentOutput(attempt, enableThinking, enableWebSearch)
-    let firstDelta = true
-    const writeDelta = (delta) => {
-        if (!delta || Object.keys(delta).length === 0) return
-        const normalizedDelta = firstDelta ? { role: 'assistant', ...delta } : delta
-        firstDelta = false
-        res.write(`data: ${JSON.stringify({
-            id: `chatcmpl-${messageId}`,
-            object: 'chat.completion.chunk',
-            created,
-            choices: [{ index: 0, delta: normalizedDelta, finish_reason: null }]
-        })}\n\n`)
+    let bufferedReasoning = output.reasoning
+    const acceptedReasoningWasStreamed = liveReasoningByAttempt.has(runtime.attempts)
+    const rawAcceptedReasoning = String(attempt.reasoning || '')
+    if (acceptedReasoningWasStreamed && rawAcceptedReasoning && bufferedReasoning.endsWith(rawAcceptedReasoning)) {
+        // 已实时发送的安全思考不能在门禁通过后再重复回放。若前面附加了搜索表格，
+        // 只补发这一段派生前缀。
+        bufferedReasoning = bufferedReasoning.slice(0, -rawAcceptedReasoning.length)
     }
 
-    if (output.reasoning) writeDelta({ reasoning_content: output.reasoning })
+    if (bufferedReasoning) writeDelta({ reasoning_content: bufferedReasoning })
     if (output.content) writeDelta({ content: output.content })
 
     const ARG_CHUNK_SIZE = 32
@@ -310,8 +366,6 @@ const handleOpenAIAgentStream = async (
             })
         }
     }
-    if (firstDelta) writeDelta({ role: 'assistant' })
-
     const completionText = `${output.reasoning}${output.content}${JSON.stringify(attempt.toolCalls || [])}`
     const usage = normalizeAgentUsage(attempt, requestBody, completionText)
     attributeChatUsage(options.currentAccount, usage)
@@ -329,6 +383,7 @@ const handleOpenAIAgentStream = async (
         usage
     })}\n\n`)
     res.write('data: [DONE]\n\n')
+    if (typeof res.flush === 'function') res.flush()
     res.end()
 }
 
