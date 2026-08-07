@@ -13,6 +13,7 @@ const config = require('../config/index.js')
 const { logger } = require('../utils/logger')
 const { createUpstreamDeltaNormalizer } = require('../utils/chat-helpers.js')
 const { assertNoUpstreamFailure } = require('../utils/upstream-error.js')
+const { runOpenAIAgentTurn } = require('../utils/openai-agent-runtime.js')
 
 const normalizeOpenAIFinishReason = (upstreamReason, hasToolCalls, upstreamCompleted) => {
     if (hasToolCalls) return 'tool_calls'
@@ -165,7 +166,245 @@ const attributeChatUsage = (account, usage) => {
     }
 }
 
+const writeOpenAIHttpError = (res, error = {}) => {
+    const status = Number(error.status) || 502
+    const message = error.message || '上游未能生成有效响应'
+    const code = error.code || 'upstream_error'
+    if (res.headersSent) {
+        if (!res.writableEnded) writeOpenAIStreamError(res, message, code)
+        return
+    }
+    res.status(status)
+    res.set({ 'Content-Type': 'application/json' })
+    res.json({
+        error: {
+            message,
+            type: status === 429 ? 'rate_limit_error' : 'upstream_error',
+            code
+        }
+    })
+}
+
+const runWithProcessingHeartbeat = async (res, work, intervalMs = 15000) => {
+    if (typeof res?.writeProcessing !== 'function') return work()
+    const heartbeatMs = Math.max(1, Number(intervalMs) || 15000)
+    const heartbeat = setInterval(() => {
+        if (res.headersSent || res.writableEnded || res.destroyed) return
+        try {
+            // 102 是临时响应，不会提交最终状态码/响应头。这样既能保持长 thinking
+            // 连接活跃，又能在门禁耗尽时返回真正的 HTTP 429/503。
+            res.writeProcessing()
+        } catch (_) {
+            // 某些 HTTP/2/反代适配器不实现临时响应；跳过即可，不能改发 SSE 注释。
+        }
+    }, heartbeatMs)
+    heartbeat.unref?.()
+    try {
+        return await work()
+    } finally {
+        clearInterval(heartbeat)
+    }
+}
+
+const normalizeAgentUsage = (attempt, requestBody, completionText) => {
+    let usage = { ...(attempt?.totalTokens || {}) }
+    if (!usage.prompt_tokens && !usage.completion_tokens) {
+        usage = createUsageObject(requestBody?.messages || [], completionText, null)
+    }
+    usage.prompt_tokens = Math.max(0, Number(usage.prompt_tokens) || 0)
+    usage.completion_tokens = Math.max(0, Number(usage.completion_tokens) || 0)
+    usage.total_tokens = usage.prompt_tokens + usage.completion_tokens
+    return usage
+}
+
+const prepareAgentOutput = async (attempt, enableThinking, enableWebSearch) => {
+    let reasoning = String(attempt?.reasoning || '')
+    let content = attempt?.toolCalls?.length > 0 ? '' : String(attempt?.visibleText || '')
+
+    if (attempt?.webSearchInfo) {
+        const table = await accountManager.generateMarkdownTable(attempt.webSearchInfo, config.searchInfoMode)
+        if (enableThinking && reasoning) reasoning = `${table}\n\n${reasoning}`
+        else if (enableWebSearch && config.searchInfoMode === 'text') {
+            content = `${content}${content ? '\n\n' : ''}---\n${table}`
+        }
+    }
+
+    if (config.legacyReasoningInContent && reasoning) {
+        content = `<think>\n\n${reasoning}\n\n</think>${content ? `\n${content}` : ''}`
+        reasoning = ''
+    }
+    return { reasoning, content }
+}
+
+const handleOpenAIAgentStream = async (
+    res,
+    response,
+    enableThinking,
+    enableWebSearch,
+    requestBody,
+    options
+) => {
+    let runtime
+    try {
+        runtime = await runWithProcessingHeartbeat(
+            res,
+            () => runOpenAIAgentTurn(response, {
+                ...options,
+                requestBody,
+                sendChatRequest: options.sendChatRequest || sendChatRequest
+            }),
+            options.agent_processing_heartbeat_ms
+        )
+    } catch (error) {
+        logger.error('OpenAI Agent 回合处理失败', 'AGENT', '', error)
+        writeOpenAIHttpError(res, {
+            status: 502,
+            message: error.publicMessage || '上游 Agent 回合处理失败',
+            code: error.code || 'upstream_stream_error'
+        })
+        return
+    }
+    if (!runtime.ok) {
+        writeOpenAIHttpError(res, runtime.error)
+        return
+    }
+
+    setResponseHeaders(res, true)
+    const messageId = generateUUID()
+    const created = Math.round(Date.now() / 1000)
+    const { attempt, finishReason } = runtime
+    const output = await prepareAgentOutput(attempt, enableThinking, enableWebSearch)
+    let firstDelta = true
+    const writeDelta = (delta) => {
+        if (!delta || Object.keys(delta).length === 0) return
+        const normalizedDelta = firstDelta ? { role: 'assistant', ...delta } : delta
+        firstDelta = false
+        res.write(`data: ${JSON.stringify({
+            id: `chatcmpl-${messageId}`,
+            object: 'chat.completion.chunk',
+            created,
+            choices: [{ index: 0, delta: normalizedDelta, finish_reason: null }]
+        })}\n\n`)
+    }
+
+    if (output.reasoning) writeDelta({ reasoning_content: output.reasoning })
+    if (output.content) writeDelta({ content: output.content })
+
+    const ARG_CHUNK_SIZE = 32
+    for (const call of attempt.toolCalls || []) {
+        writeDelta({
+            tool_calls: [{
+                index: call.index,
+                id: call.id,
+                type: 'function',
+                function: { name: call.function.name, arguments: '' }
+            }]
+        })
+        const args = call.function.arguments || '{}'
+        for (let offset = 0; offset < args.length; offset += ARG_CHUNK_SIZE) {
+            writeDelta({
+                tool_calls: [{
+                    index: call.index,
+                    function: { arguments: args.slice(offset, offset + ARG_CHUNK_SIZE) }
+                }]
+            })
+        }
+    }
+    if (firstDelta) writeDelta({ role: 'assistant' })
+
+    const completionText = `${output.reasoning}${output.content}${JSON.stringify(attempt.toolCalls || [])}`
+    const usage = normalizeAgentUsage(attempt, requestBody, completionText)
+    attributeChatUsage(options.currentAccount, usage)
+    res.write(`data: ${JSON.stringify({
+        id: `chatcmpl-${messageId}`,
+        object: 'chat.completion.chunk',
+        created,
+        choices: [{ index: 0, delta: {}, finish_reason: finishReason }]
+    })}\n\n`)
+    res.write(`data: ${JSON.stringify({
+        id: `chatcmpl-${messageId}`,
+        object: 'chat.completion.chunk',
+        created,
+        choices: [],
+        usage
+    })}\n\n`)
+    res.write('data: [DONE]\n\n')
+    res.end()
+}
+
+const handleOpenAIAgentNonStream = async (
+    res,
+    response,
+    enableThinking,
+    enableWebSearch,
+    model,
+    requestBody,
+    options
+) => {
+    let runtime
+    try {
+        runtime = await runWithProcessingHeartbeat(
+            res,
+            () => runOpenAIAgentTurn(response, {
+                ...options,
+                requestBody,
+                sendChatRequest: options.sendChatRequest || sendChatRequest
+            }),
+            options.agent_processing_heartbeat_ms
+        )
+    } catch (error) {
+        logger.error('OpenAI 非流式 Agent 回合处理失败', 'AGENT', '', error)
+        writeOpenAIHttpError(res, {
+            status: 502,
+            message: error.publicMessage || '上游 Agent 回合处理失败',
+            code: error.code || 'upstream_error'
+        })
+        return
+    }
+    if (!runtime.ok) {
+        writeOpenAIHttpError(res, runtime.error)
+        return
+    }
+
+    setResponseHeaders(res, false)
+    const { attempt, finishReason } = runtime
+    const output = await prepareAgentOutput(attempt, enableThinking, enableWebSearch)
+    const assistantMessage = {
+        role: 'assistant',
+        content: output.content || (attempt.toolCalls.length > 0 ? null : '')
+    }
+    if (output.reasoning) assistantMessage.reasoning_content = output.reasoning
+    if (attempt.toolCalls.length > 0) {
+        assistantMessage.tool_calls = attempt.toolCalls.map(call => ({
+            id: call.id,
+            type: 'function',
+            function: { ...call.function }
+        }))
+    }
+    const completionText = `${output.reasoning}${output.content}${JSON.stringify(attempt.toolCalls || [])}`
+    const usage = normalizeAgentUsage(attempt, requestBody, completionText)
+    attributeChatUsage(options.currentAccount, usage)
+    res.json({
+        id: `chatcmpl-${generateUUID()}`,
+        object: 'chat.completion',
+        created: Math.round(Date.now() / 1000),
+        model,
+        choices: [{ index: 0, message: assistantMessage, finish_reason: finishReason }],
+        usage
+    })
+}
+
 const handleStreamResponse = async (res, response, enable_thinking, enable_web_search, requestBody = null, options = {}) => {
+    if (options.has_tools && options.strict_agent_turn !== false) {
+        return handleOpenAIAgentStream(
+            res,
+            response,
+            enable_thinking,
+            enable_web_search,
+            requestBody,
+            options
+        )
+    }
     try {
         const message_id = generateUUID()
         let web_search_info = null
@@ -657,6 +896,17 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
  * @param {boolean} [options.has_tools] - 是否启用工具调用解析
  */
 const handleNonStreamResponse = async (res, response, enable_thinking, enable_web_search, model, requestBody = null, options = {}) => {
+    if (options.has_tools && options.strict_agent_turn !== false) {
+        return handleOpenAIAgentNonStream(
+            res,
+            response,
+            enable_thinking,
+            enable_web_search,
+            model,
+            requestBody,
+            options
+        )
+    }
     try {
         let fullContent = ''
         let fullReasoning = '' // 新版模式下累积的推理内容（reasoning_content）
@@ -1010,7 +1260,12 @@ const handleChatCompletion = async (req, res) => {
                 has_tools: req.has_tools,
                 tool_choice: req.tool_choice,
                 allowed_tool_names: req.allowed_tool_names,
-                currentAccount: response_data.currentAccount
+                currentAccount: response_data.currentAccount,
+                upstream_request_body: response_data.requestBody,
+                upstream_context: {
+                    chatId: response_data.chatId,
+                    parentId: response_data.parentId
+                }
             })
         } else {
             setResponseHeaders(res, false)
@@ -1018,7 +1273,12 @@ const handleChatCompletion = async (req, res) => {
                 has_tools: req.has_tools,
                 tool_choice: req.tool_choice,
                 allowed_tool_names: req.allowed_tool_names,
-                currentAccount: response_data.currentAccount
+                currentAccount: response_data.currentAccount,
+                upstream_request_body: response_data.requestBody,
+                upstream_context: {
+                    chatId: response_data.chatId,
+                    parentId: response_data.parentId
+                }
             })
         }
 

@@ -15,8 +15,19 @@ const {
   handleAnthropicStream,
   handleAnthropicNonStream
 } = require('../src/controllers/anthropic.js')
-const { externalizeOversizedAgentContext } = require('../src/utils/request.js')
+const {
+  externalizeOversizedAgentContext,
+  compactAgentContextFallback
+} = require('../src/utils/request.js')
 const { assertNoUpstreamFailure } = require('../src/utils/upstream-error.js')
+const {
+  shouldEnableToolRuntime,
+  ensureAgentCurrentEnvelope
+} = require('../src/middlewares/chat-middleware.js')
+const {
+  buildAgentTurnDirective,
+  parseAgentControlText
+} = require('../src/utils/agent-turn.js')
 
 test.after(() => {
   require('../src/utils/account.js').destroy()
@@ -196,6 +207,295 @@ test('thinking-only Agent turns retry once and recover visible output', async ()
   assert.match(anthropicRes.output, /event: message_stop/)
 })
 
+test('strict OpenAI Agent gate keeps retry attempts isolated until a real tool call is produced', async () => {
+  const retryOptions = []
+  let retries = 0
+  const res = createMockResponse()
+  const retryFrames = [
+    [
+      'data: {"response.created":{"chat_id":"chat_agent","parent_id":"p1","response_id":"resp_2","response_index":"0"}}\n\n',
+      'data: {"choices":[{"delta":{"phase":"answer","content":"I will inspect the repository now."},"finish_reason":"stop"}],"response_id":"resp_2"}\n\n'
+    ],
+    [
+      'data: {"response.created":{"chat_id":"chat_agent","parent_id":"resp_2","response_id":"resp_3","response_index":"0"}}\n\n',
+      'data: {"choices":[{"delta":{"phase":"answer","content":"<tool_call>{\\"name\\":\\"read_file\\",\\"arguments\\":{\\"path\\":\\"README.md\\"}}</tool_call>"},"finish_reason":"stop"}],"response_id":"resp_3"}\n\n'
+    ]
+  ]
+
+  await handleStreamResponse(
+    res,
+    Readable.from([
+      'data: {"response.created":{"chat_id":"chat_agent","parent_id":"root","response_id":"resp_1","response_index":"0"}}\n\n',
+      'data: {"choices":[{"delta":{"phase":"think","content":"first attempt planning"},"finish_reason":"stop"}],"response_id":"resp_1"}\n\n'
+    ]),
+    true,
+    false,
+    { messages: [{ role: 'user', content: 'finish the whole task' }] },
+    {
+      has_tools: true,
+      tool_choice: 'auto',
+      allowed_tool_names: ['read_file'],
+      agent_turn_max_attempts: 3,
+      sendChatRequest: async (_body, options) => {
+        retryOptions.push(options)
+        const frames = retryFrames[retries]
+        retries += 1
+        return { status: true, response: Readable.from(frames), chatId: 'chat_agent' }
+      }
+    }
+  )
+
+  assert.equal(retries, 2)
+  assert.equal(retryOptions[0].chatId, 'chat_agent')
+  assert.equal(retryOptions[0].parentId, 'resp_1')
+  assert.equal(retryOptions[1].parentId, 'resp_2')
+  assert.match(res.output, /"name":"read_file"/)
+  assert.match(res.output, /"finish_reason":"tool_calls"/)
+  assert.doesNotMatch(res.output, /first attempt planning/)
+  assert.doesNotMatch(res.output, /I will inspect/)
+})
+
+test('strict OpenAI Agent gate accepts only explicit verified completion and strips control tags', async () => {
+  let retries = 0
+  const res = createMockResponse()
+  await handleStreamResponse(
+    res,
+    Readable.from([
+      'data: {"choices":[{"delta":{"phase":"answer","content":"<agent_final>All requested changes were implemented and tests passed.</agent_final>"},"finish_reason":"stop"}]}\n\n'
+    ]),
+    false,
+    false,
+    { messages: [{ role: 'user', content: 'finish the task' }] },
+    {
+      has_tools: true,
+      tool_choice: 'auto',
+      allowed_tool_names: ['read_file'],
+      sendChatRequest: async () => { retries += 1 }
+    }
+  )
+
+  assert.equal(retries, 0)
+  assert.match(res.output, /All requested changes were implemented and tests passed/)
+  assert.match(res.output, /"finish_reason":"stop"/)
+  assert.doesNotMatch(res.output, /agent_final/)
+})
+
+test('strict OpenAI Agent gate never turns repeated bare prose into a normal stop', async () => {
+  let retries = 0
+  const res = createMockResponse()
+  await handleStreamResponse(
+    res,
+    Readable.from(['data: {"choices":[{"delta":{"phase":"answer","content":"Looks good."},"finish_reason":"stop"}]}\n\n']),
+    false,
+    false,
+    { messages: [{ role: 'user', content: 'complete and verify the task' }] },
+    {
+      has_tools: true,
+      tool_choice: 'auto',
+      allowed_tool_names: ['run_tests'],
+      agent_turn_max_attempts: 3,
+      sendChatRequest: async () => {
+        retries += 1
+        return {
+          status: true,
+          response: Readable.from(['data: {"choices":[{"delta":{"phase":"answer","content":"Still looks good."},"finish_reason":"stop"}]}\n\n'])
+        }
+      }
+    }
+  )
+
+  assert.equal(retries, 2)
+  assert.equal(res.statusCode, 429)
+  assert.match(res.output, /upstream_agent_turn_incomplete/)
+  assert.doesNotMatch(res.output, /\[DONE\]/)
+  assert.doesNotMatch(res.output, /"finish_reason":"stop"/)
+})
+
+test('strict OpenAI Agent gate preserves max-token termination without synthetic retries', async () => {
+  let retries = 0
+  const res = createMockResponse()
+  await handleStreamResponse(
+    res,
+    Readable.from([
+      'data: {"choices":[{"delta":{"phase":"answer","content":"partial output"},"finish_reason":"length"}]}\n\n'
+    ]),
+    false,
+    false,
+    { messages: [] },
+    {
+      has_tools: true,
+      tool_choice: 'auto',
+      allowed_tool_names: ['read_file'],
+      sendChatRequest: async () => { retries += 1 }
+    }
+  )
+  assert.equal(retries, 0)
+  assert.match(res.output, /partial output/)
+  assert.match(res.output, /"finish_reason":"length"/)
+})
+
+test('strict non-stream Agent gate uses the primary response id and isolates all correction attempts', async () => {
+  const retryBodies = []
+  const retryOptions = []
+  const res = createMockResponse()
+  const retryFrames = [
+    [
+      'data: {"response.created":{"chat_id":"chat_agent","response_id":"resp_2","response_index":"0"}}\n\n',
+      'data: {"choices":[{"delta":{"phase":"answer","content":"I will run the tests next."},"finish_reason":"stop"}],"response_id":"resp_2"}\n\n'
+    ],
+    [
+      'data: {"response.created":{"chat_id":"chat_agent","response_id":"resp_3","response_index":"0"}}\n\n',
+      'data: {"choices":[{"delta":{"phase":"answer","content":"<tool_call>{\\"name\\":\\"run_tests\\",\\"arguments\\":{}}</tool_call>"},"finish_reason":"stop"}],"response_id":"resp_3"}\n\n'
+    ]
+  ]
+
+  await handleNonStreamResponse(
+    res,
+    Readable.from([
+      'data: {"response.created":{"chat_id":"chat_agent","response_id":"primary_1","response_index":"0"}}\n\n',
+      'data: {"response.created":{"chat_id":"chat_agent","response_id":"fallback_1","response_index":"1"}}\n\n'
+    ]),
+    false,
+    false,
+    'qwen-test',
+    { messages: [{ role: 'user', content: 'ORIGINAL_CONTEXT' }] },
+    {
+      has_tools: true,
+      tool_choice: 'auto',
+      allowed_tool_names: ['run_tests'],
+      agent_turn_max_attempts: 3,
+      upstream_request_body: { messages: [{ role: 'user', content: 'EXTERNALIZED_LIVE_CONTEXT' }] },
+      sendChatRequest: async (body, options) => {
+        retryBodies.push(body)
+        retryOptions.push(options)
+        return {
+          status: true,
+          response: Readable.from(retryFrames[retryBodies.length - 1]),
+          chatId: 'chat_agent'
+        }
+      }
+    }
+  )
+
+  assert.equal(retryBodies.length, 2)
+  assert.match(retryBodies[0].messages[0].content, /EXTERNALIZED_LIVE_CONTEXT/)
+  assert.doesNotMatch(retryBodies[0].messages[0].content, /ORIGINAL_CONTEXT/)
+  assert.equal(retryOptions[0].parentId, 'primary_1')
+  assert.equal(retryOptions[1].parentId, 'resp_2')
+  const payload = JSON.parse(res.output)
+  assert.equal(payload.choices[0].finish_reason, 'tool_calls')
+  assert.equal(payload.choices[0].message.content, null)
+  assert.equal(payload.choices[0].message.tool_calls[0].function.name, 'run_tests')
+  assert.doesNotMatch(res.output, /I will run the tests next/)
+})
+
+test('strict non-stream Agent gate returns an HTTP error instead of a fake completion when attempts are exhausted', async () => {
+  let retries = 0
+  let processingHeartbeats = 0
+  const res = createMockResponse()
+  res.writeProcessing = () => { processingHeartbeats += 1 }
+  await handleNonStreamResponse(
+    res,
+    Readable.from(['data: {"choices":[{"delta":{"phase":"answer","content":"Done."},"finish_reason":"stop"}]}\n\n']),
+    false,
+    false,
+    'qwen-test',
+    { messages: [{ role: 'user', content: 'finish and verify everything' }] },
+    {
+      has_tools: true,
+      tool_choice: 'auto',
+      allowed_tool_names: ['run_tests'],
+      agent_turn_max_attempts: 2,
+      agent_processing_heartbeat_ms: 1,
+      sendChatRequest: async () => {
+        retries += 1
+        await new Promise(resolve => setTimeout(resolve, 8))
+        return {
+          status: true,
+          response: Readable.from(['data: {"choices":[{"delta":{"phase":"answer","content":"Still done."},"finish_reason":"stop"}]}\n\n'])
+        }
+      }
+    }
+  )
+
+  assert.equal(retries, 1)
+  assert.ok(processingHeartbeats > 0)
+  assert.equal(res.statusCode, 429)
+  const payload = JSON.parse(res.output)
+  assert.equal(payload.error.code, 'upstream_agent_turn_incomplete')
+  assert.equal(Object.hasOwn(payload, 'choices'), false)
+})
+
+test('a standalone tool call emitted in the thinking phase remains executable', async () => {
+  let retries = 0
+  const res = createMockResponse()
+  await handleStreamResponse(
+    res,
+    Readable.from([
+      'data: {"choices":[{"delta":{"phase":"think","content":"<tool_call>{\\"name\\":\\"read_file\\",\\"arguments\\":{\\"path\\":\\"README.md\\"}}</tool_call>"},"finish_reason":"stop"}]}\n\n'
+    ]),
+    true,
+    false,
+    { messages: [{ role: 'user', content: 'inspect the repository' }] },
+    {
+      has_tools: true,
+      tool_choice: 'auto',
+      allowed_tool_names: ['read_file'],
+      sendChatRequest: async () => { retries += 1 }
+    }
+  )
+
+  assert.equal(retries, 0)
+  assert.match(res.output, /"name":"read_file"/)
+  assert.match(res.output, /"finish_reason":"tool_calls"/)
+  assert.doesNotMatch(res.output, /<tool_call>/)
+})
+
+test('a partially invalid multi-tool turn is rejected as a whole', async () => {
+  let retries = 0
+  const res = createMockResponse()
+  await handleStreamResponse(
+    res,
+    Readable.from([
+      'data: {"choices":[{"delta":{"phase":"answer","content":"<tool_call>{\\"name\\":\\"read_file\\",\\"arguments\\":{\\"path\\":\\"README.md\\"}}</tool_call><tool_call>{\\"name\\":\\"missing_tool\\",\\"arguments\\":{}}</tool_call>"},"finish_reason":"stop"}]}\n\n'
+    ]),
+    false,
+    false,
+    { messages: [{ role: 'user', content: 'inspect everything' }] },
+    {
+      has_tools: true,
+      tool_choice: 'auto',
+      allowed_tool_names: ['read_file'],
+      sendChatRequest: async () => {
+        retries += 1
+        return {
+          status: true,
+          response: Readable.from([
+            'data: {"choices":[{"delta":{"phase":"answer","content":"<agent_final>Unable to proceed without a valid second tool.</agent_final>"},"finish_reason":"stop"}]}\n\n'
+          ])
+        }
+      }
+    }
+  )
+
+  assert.equal(retries, 1)
+  assert.match(res.output, /Unable to proceed/)
+  assert.doesNotMatch(res.output, /"name":"read_file"/)
+})
+
+test('tool_choice none bypasses the Agent tool runtime even when definitions are present', () => {
+  const tools = [{ type: 'function', function: { name: 'read_file' } }]
+  assert.equal(shouldEnableToolRuntime(tools, 't2t', 'auto'), true)
+  assert.equal(shouldEnableToolRuntime(tools, 't2t', 'none'), false)
+})
+
+test('single-message Agent requests get an explicit current-task envelope', () => {
+  const wrapped = ensureAgentCurrentEnvelope('SINGLE_MESSAGE_TASK', 'user')
+  assert.match(wrapped, /^# Current message\n/)
+  assert.match(wrapped, /SINGLE_MESSAGE_TASK/)
+  assert.equal(ensureAgentCurrentEnvelope(wrapped, 'user'), wrapped)
+})
+
 test('prose-only Agent actions are retried into executable tool calls', async () => {
   let openAIRetries = 0
   const openAIRes = createMockResponse()
@@ -356,6 +656,74 @@ test('oversized multimodal Agent context is externalized and upload failure keep
   assert.match(compacted.payload.messages[0].content, /strict tool protocol with read_file/)
   assert.match(compacted.payload.messages[0].content, /continue the unfinished task/)
   assert.ok(Buffer.byteLength(compacted.payload.messages[0].content) <= 4096)
+})
+
+test('externalized Agent context keeps system rules active task and recent tool progress inline', async () => {
+  const original = [
+    '# Tools',
+    'strict tool protocol',
+    '# Conversation history (JSONL)',
+    JSON.stringify({ role: 'system', content: 'SYSTEM_RULE_MUST_SURVIVE' }),
+    JSON.stringify({ role: 'user', content: 'ACTIVE_TASK_MUST_SURVIVE: fix and verify the project' }),
+    JSON.stringify({ role: 'assistant', content: '<tool_call>{"name":"bash","arguments":{"command":"test"}}</tool_call>' }),
+    JSON.stringify({ role: 'user', content: `<tool_response name="bash">RECENT_PROGRESS_MUST_SURVIVE ${'x'.repeat(5000)}</tool_response>` }),
+    '# Current message',
+    JSON.stringify({ role: 'user', content: '<tool_response name="bash">CURRENT_RESULT_MUST_SURVIVE</tool_response>' }),
+    buildAgentTurnDirective({ afterToolResult: true })
+  ].join('\n')
+  const result = await externalizeOversizedAgentContext(
+    { messages: [{ role: 'user', content: original }] },
+    'token',
+    {},
+    {
+      thresholdBytes: 1024,
+      livePromptBytes: 8192,
+      uploader: async () => ({ id: 'agent_context', name: 'QWEN2API_AGENT_CONTEXT.txt' })
+    }
+  )
+  const live = result.payload.messages[0].content
+  assert.match(live, /SYSTEM_RULE_MUST_SURVIVE/)
+  assert.match(live, /ACTIVE_TASK_MUST_SURVIVE/)
+  assert.match(live, /RECENT_PROGRESS_MUST_SURVIVE/)
+  assert.match(live, /CURRENT_RESULT_MUST_SURVIVE/)
+  assert.match(live, /not a reason to stop after one action/)
+
+  const recovered = compactAgentContextFallback(original, 8192)
+  assert.match(recovered, /SYSTEM_RULE_MUST_SURVIVE/)
+  assert.match(recovered, /ACTIVE_TASK_MUST_SURVIVE/)
+  assert.match(recovered, /RECENT_PROGRESS_MUST_SURVIVE/)
+  assert.match(recovered, /CURRENT_RESULT_MUST_SURVIVE/)
+  assert.doesNotMatch(recovered, /complete copy is in the attachment/)
+  assert.ok(Buffer.byteLength(recovered) <= 8192)
+})
+
+test('externalized single-message Agent context keeps the original task outside large tool schemas', async () => {
+  const original = [
+    '# Tools',
+    `LARGE_TOOL_SCHEMA ${'s'.repeat(12000)}`,
+    ensureAgentCurrentEnvelope('SINGLE_ACTIVE_TASK_MUST_SURVIVE', 'user'),
+    buildAgentTurnDirective()
+  ].join('\n\n')
+  const result = await externalizeOversizedAgentContext(
+    { messages: [{ role: 'user', content: original }] },
+    'token',
+    {},
+    {
+      thresholdBytes: 1024,
+      livePromptBytes: 4096,
+      uploader: async () => ({ id: 'single_context', name: 'QWEN2API_AGENT_CONTEXT.txt' })
+    }
+  )
+
+  assert.equal(result.externalized, true)
+  assert.match(result.payload.messages[0].content, /SINGLE_ACTIVE_TASK_MUST_SURVIVE/)
+  assert.ok(Buffer.byteLength(result.payload.messages[0].content) <= 4096)
+})
+
+test('Agent completion control parser rejects bare and mixed completion claims', () => {
+  assert.deepEqual(parseAgentControlText('<agent_final>done</agent_final>'), { kind: 'final', text: 'done' })
+  assert.equal(parseAgentControlText('done').kind, 'bare')
+  assert.equal(parseAgentControlText('prefix <agent_final>done</agent_final>').kind, 'invalid_control')
 })
 
 test('Qwen HTTP-200 WAF payload is surfaced as an explicit failure', () => {
