@@ -9,6 +9,7 @@ const { createUpstreamDeltaNormalizer } = require('./chat-helpers.js')
 const { assertNoUpstreamFailure } = require('./upstream-error.js')
 const {
   parseAgentControlText,
+  createAgentControlStreamParser,
   buildAgentRetryHint
 } = require('./agent-turn.js')
 const config = require('../config/index.js')
@@ -41,8 +42,8 @@ const imageMarkdownFromDelta = (delta) => {
 }
 
 /**
- * 完整消费一次 Qwen 上游 attempt。正文与工具调用始终留在门禁内；调用方可通过
- * on_reasoning_delta 实时接收已经确认不属于 <tool_call> 的思考增量。
+ * 完整消费一次 Qwen 上游 attempt。裸正文与工具调用始终留在门禁内；调用方可
+ * 实时接收安全思考，以及已经进入 final/blocked 包装体的正式正文增量。
  * 每次调用都新建 parser/filter/accumulator，失败 attempt 不会污染下一次。
  */
 const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
@@ -56,12 +57,52 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
   const reasoningStreamParser = typeof options.on_reasoning_delta === 'function'
     ? createToolCallStreamParser({ allowedToolNames })
     : null
+  const controlStreamParser = typeof options.on_content_delta === 'function'
+    ? createAgentControlStreamParser()
+    : null
+  const controlToolStreamParser = controlStreamParser
+    ? createToolCallStreamParser({ allowedToolNames })
+    : null
+  let streamedVisibleText = ''
+  let streamedControlKind = null
+  let controlToolParserFlushed = false
 
   const emitReasoningDelta = async (text) => {
     if (typeof options.on_reasoning_delta !== 'function') return
     await options.on_reasoning_delta(text || '', {
       attemptNumber: Math.max(1, Number(options.attempt_number) || 1)
     })
+  }
+
+  const emitContentDelta = async (text, kind) => {
+    if (!text || typeof options.on_content_delta !== 'function') return
+    streamedVisibleText += text
+    streamedControlKind = kind || streamedControlKind
+    await options.on_content_delta(text, {
+      attemptNumber: Math.max(1, Number(options.attempt_number) || 1),
+      kind: streamedControlKind
+    })
+  }
+
+  const consumeControlStreamResult = async (result) => {
+    if (!result || !controlToolStreamParser) return
+    if (result.textDelta) {
+      const parsed = controlToolStreamParser.push(result.textDelta)
+      await emitContentDelta(parsed.textDelta, result.kind)
+    }
+    if (result.closed && !controlToolParserFlushed) {
+      controlToolParserFlushed = true
+      const parsed = controlToolStreamParser.flush()
+      await emitContentDelta(parsed.textDelta, result.kind)
+    }
+  }
+
+  const appendAnswer = async (text) => {
+    if (!text) return
+    answer += text
+    if (controlStreamParser) {
+      await consumeControlStreamResult(controlStreamParser.push(text))
+    }
   }
 
   let reasoning = ''
@@ -142,7 +183,7 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
         pendingImages.push(...images)
       } else {
         const markdown = `${images.join('\n\n')}\n\n`
-        answer += markdown
+        await appendAnswer(markdown)
         images.forEach(item => emittedImages.add(item))
       }
     }
@@ -159,16 +200,19 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
 
     answerStarted = true
     if (pendingImages.length > 0) {
-      answer += `${pendingImages.join('\n\n')}\n\n`
+      await appendAnswer(`${pendingImages.join('\n\n')}\n\n`)
       pendingImages.forEach(item => emittedImages.add(item))
       pendingImages.length = 0
     }
-    answer += normalized.content
+    await appendAnswer(normalized.content)
   })
 
   if (reasoningStreamParser) {
     const streamed = reasoningStreamParser.flush()
     await emitReasoningDelta(streamed.textDelta)
+  }
+  if (controlStreamParser) {
+    await consumeControlStreamResult(controlStreamParser.flush())
   }
 
   const textTools = hasTools
@@ -208,6 +252,9 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
     rawAnswer: answer,
     visibleText: control.text,
     controlKind: control.kind,
+    streamedVisibleText,
+    streamedControlKind,
+    streamedControlState: controlStreamParser?.getState?.() || null,
     toolCalls,
     toolErrors,
     webSearchInfo,
@@ -238,6 +285,9 @@ const evaluateOpenAIAgentAttempt = (attempt, options = {}) => {
     return { accepted: false, finishReason: null, retryReason: 'invalid_tool_call' }
   }
   if (attempt.toolCalls.length > 0) {
+    if (attempt.controlKind !== 'empty' || attempt.visibleText.trim()) {
+      return { accepted: false, finishReason: null, retryReason: 'invalid_tool_call' }
+    }
     return { accepted: true, finishReason: 'tool_calls', retryReason: null }
   }
   if (requiresToolCall(options.tool_choice)) {
@@ -318,6 +368,7 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
   let lastEvaluation = null
   let upstreamContext = { ...(options.upstream_context || {}) }
   const retryBaseBody = options.upstream_request_body || options.requestBody
+  let attemptsMade = 0
 
   const mergePresent = (base, extra) => {
     const merged = { ...base }
@@ -328,6 +379,7 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
   }
 
   for (let attemptNumber = 1; attemptNumber <= maxAttempts; attemptNumber++) {
+    attemptsMade = attemptNumber
     const attempt = await collectOpenAIAgentAttempt(currentResponse, {
       ...options,
       attempt_number: attemptNumber
@@ -350,6 +402,18 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
       `Agent attempt ${attemptNumber}/${maxAttempts} 被回合门禁拒绝 (${evaluation.retryReason})`,
       'AGENT'
     )
+    if (attempt.streamedVisibleText) {
+      return {
+        ok: false,
+        error: {
+          status: 422,
+          message: '上游在已开始流式输出正式回复后返回了无效的 Agent 结束结构',
+          code: 'upstream_agent_stream_invalidated'
+        },
+        attempt,
+        attempts: attemptNumber
+      }
+    }
     if (attemptNumber >= maxAttempts || typeof requestSender !== 'function') break
 
     const retryBody = appendRetryHint(
@@ -385,7 +449,7 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
     ok: false,
     error: exhaustedError(lastAttempt, lastEvaluation?.retryReason),
     attempt: lastAttempt,
-    attempts: maxAttempts
+    attempts: attemptsMade
   }
 }
 

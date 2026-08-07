@@ -35,6 +35,157 @@ const parseAgentControlText = (value) => {
   return { kind: 'bare', text: trimmed }
 }
 
+/**
+ * 增量识别严格 Agent 的 final/blocked 包装。只有开标签位于首个非空白位置时
+ * 才开放正文；闭标签及其可能跨 chunk 的前缀始终留在缓冲区。
+ *
+ * 正文采用与 parseAgentControlText 相同的 trim 语义：丢弃包装内的首尾空白，
+ * 中间空白仍按原顺序增量输出。完整合法性最终仍由 parseAgentControlText 判定。
+ */
+const createAgentControlStreamParser = () => {
+  const modes = [
+    { kind: 'final', open: AGENT_FINAL_OPEN, close: AGENT_FINAL_CLOSE },
+    { kind: 'blocked', open: AGENT_BLOCKED_OPEN, close: AGENT_BLOCKED_CLOSE }
+  ]
+  let state = 'prefix'
+  let mode = null
+  let pending = ''
+  let bodyStarted = false
+  let trailingWhitespace = ''
+  let emittedText = false
+  let invalid = false
+
+  const createResult = () => ({
+    textDelta: '',
+    kind: mode?.kind || null,
+    opened: false,
+    closed: state === 'closed' && !invalid,
+    invalid
+  })
+
+  const appendBodyText = (value, final, result) => {
+    let text = String(value || '')
+    if (!bodyStarted) {
+      text = text.replace(/^\s+/, '')
+      if (!text) {
+        if (final) trailingWhitespace = ''
+        return
+      }
+      bodyStarted = true
+    }
+
+    const combined = `${trailingWhitespace}${text}`
+    const trailing = combined.match(/\s+$/)?.[0] || ''
+    const safe = trailing ? combined.slice(0, -trailing.length) : combined
+    if (safe) {
+      result.textDelta += safe
+      emittedText = true
+    }
+    trailingWhitespace = final ? '' : trailing
+  }
+
+  const splitClosePrefix = (value, closeTag) => {
+    const lower = value.toLowerCase()
+    const close = closeTag.toLowerCase()
+    const maxLength = Math.min(lower.length, close.length - 1)
+    for (let length = maxLength; length > 0; length--) {
+      if (close.startsWith(lower.slice(-length))) {
+        return {
+          safe: value.slice(0, -length),
+          remainder: value.slice(-length)
+        }
+      }
+    }
+    return { safe: value, remainder: '' }
+  }
+
+  const processBody = (result) => {
+    const closeTag = mode.close
+    const closeIndex = pending.toLowerCase().indexOf(closeTag.toLowerCase())
+    if (closeIndex !== -1) {
+      appendBodyText(pending.slice(0, closeIndex), true, result)
+      pending = pending.slice(closeIndex + closeTag.length)
+      state = 'closed'
+      result.closed = true
+      if (pending.trim()) {
+        invalid = true
+        state = 'invalid'
+        result.invalid = true
+        result.closed = false
+      }
+      return
+    }
+
+    const split = splitClosePrefix(pending, closeTag)
+    pending = split.remainder
+    appendBodyText(split.safe, false, result)
+  }
+
+  const processPrefix = (result) => {
+    const leadingLength = pending.match(/^\s*/)?.[0].length || 0
+    const candidate = pending.slice(leadingLength)
+    if (!candidate) return
+    const lowerCandidate = candidate.toLowerCase()
+    const matchedMode = modes.find(item => lowerCandidate.startsWith(item.open.toLowerCase()))
+    if (matchedMode) {
+      mode = matchedMode
+      pending = candidate.slice(matchedMode.open.length)
+      state = 'body'
+      result.kind = mode.kind
+      result.opened = true
+      processBody(result)
+      return
+    }
+
+    const isOpenPrefix = modes.some(item => item.open.toLowerCase().startsWith(lowerCandidate))
+    if (!isOpenPrefix) {
+      invalid = true
+      state = 'invalid'
+      result.invalid = true
+    }
+  }
+
+  const push = (chunk) => {
+    const result = createResult()
+    if (typeof chunk !== 'string' || chunk.length === 0 || state === 'invalid') return result
+    pending += chunk
+    if (state === 'prefix') processPrefix(result)
+    else if (state === 'body') processBody(result)
+    else if (state === 'closed' && pending.trim()) {
+      invalid = true
+      state = 'invalid'
+      result.invalid = true
+      result.closed = false
+    }
+    result.kind = mode?.kind || result.kind
+    return result
+  }
+
+  const flush = () => {
+    const result = createResult()
+    if (state !== 'closed' || pending.trim()) {
+      invalid = true
+      state = 'invalid'
+      result.invalid = true
+      result.closed = false
+    }
+    result.kind = mode?.kind || null
+    return result
+  }
+
+  return {
+    push,
+    flush,
+    getState: () => ({
+      kind: mode?.kind || null,
+      opened: mode !== null,
+      closed: state === 'closed' && !invalid,
+      invalid,
+      hasEmittedText: emittedText
+    })
+  }
+}
+
 const buildAgentTurnDirective = ({ afterToolResult = false } = {}) => {
   const continuation = afterToolResult
     ? 'The current message is a tool result from the same unfinished task. It is evidence to inspect, not a new task and not a reason to stop after one action.'
@@ -78,6 +229,7 @@ module.exports = {
   AGENT_BLOCKED_OPEN,
   AGENT_BLOCKED_CLOSE,
   parseAgentControlText,
+  createAgentControlStreamParser,
   buildAgentTurnDirective,
   buildAgentRetryHint
 }

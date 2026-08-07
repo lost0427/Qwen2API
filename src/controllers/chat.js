@@ -285,7 +285,8 @@ const handleOpenAIAgentStream = async (
     }
 
     // 立即提交标准 SSE 首帧，不能等整个上游 attempt 收完后才让客户端看到响应。
-    // 正文/工具调用仍由下方门禁缓冲；这里只开放无工具标记的思考增量。
+    // 裸正文/工具调用仍由下方门禁缓冲；安全思考与已确认进入 final/blocked
+    // 包装体的正式正文会按上游节奏增量输出。
     if (typeof res.flushHeaders === 'function') res.flushHeaders()
     writeDelta({ role: 'assistant' })
 
@@ -305,6 +306,11 @@ const handleOpenAIAgentStream = async (
             }
         }
         : null
+    const onContentDelta = !config.legacyReasoningInContent
+        ? async (text) => {
+            if (text) writeDelta({ content: text })
+        }
+        : null
 
     let runtime
     try {
@@ -314,7 +320,8 @@ const handleOpenAIAgentStream = async (
                 ...options,
                 requestBody,
                 sendChatRequest: options.sendChatRequest || sendChatRequest,
-                on_reasoning_delta: onReasoningDelta
+                on_reasoning_delta: onReasoningDelta,
+                on_content_delta: onContentDelta
             }),
             options.agent_processing_heartbeat_ms
         )
@@ -343,8 +350,25 @@ const handleOpenAIAgentStream = async (
         bufferedReasoning = bufferedReasoning.slice(0, -rawAcceptedReasoning.length)
     }
 
+    let bufferedContent = output.content
+    const streamedVisibleText = String(attempt.streamedVisibleText || '')
+    const acceptedVisibleText = String(attempt.visibleText || '')
+    if (
+        streamedVisibleText &&
+        acceptedVisibleText.startsWith(streamedVisibleText) &&
+        bufferedContent.startsWith(acceptedVisibleText)
+    ) {
+        // 正式回复的包装体已经按上游节奏实时发送，只补发极少数尚未发送的尾部，
+        // 以及门禁通过后追加的搜索信息等派生内容。
+        bufferedContent = `${acceptedVisibleText.slice(streamedVisibleText.length)}${bufferedContent.slice(acceptedVisibleText.length)}`
+    } else if (streamedVisibleText && finishReason !== 'stop' && attempt.streamedControlState?.opened) {
+        // length/content_filter 等中止发生在包装闭合前时，不能把带控制标签的原始
+        // 缓冲再次作为正文回放；已发送的安全正文由对应 finish_reason 正常收尾。
+        bufferedContent = ''
+    }
+
     if (bufferedReasoning) writeDelta({ reasoning_content: bufferedReasoning })
-    if (output.content) writeDelta({ content: output.content })
+    if (bufferedContent) writeDelta({ content: bufferedContent })
 
     const ARG_CHUNK_SIZE = 32
     for (const call of attempt.toolCalls || []) {

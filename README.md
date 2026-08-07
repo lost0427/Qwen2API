@@ -513,9 +513,9 @@ Authorization: Bearer sk-your-api-key
 - 历史消息中的 `assistant.tool_calls` 与 `role:"tool"` 自动折叠回链，`tool_call_id` 精确关联
 - `tool_choice` 全四态：`"auto"` / `"required"` / `{type:"function",function:{name:"..."}}` / `"none"`
 - 携带工具的请求启用严格三态回合门禁：未完成必须返回真实 `tool_calls`；只有显式确认全部完成或确实阻塞时才能返回 `stop`
-- 每个上游生成尝试的正文、工具调用和结束状态完全隔离；安全的 thinking 增量会实时显示，但裸计划、裸“完成”、残缺/不存在的工具调用不会被提交为正文或正常结束
+- 每个上游生成尝试的裸正文、工具调用和结束状态保持门禁隔离；安全 thinking 与合法 `agent_final` / `agent_blocked` 包装体内的正式正文都会实时显示，但只有闭标签验证通过后才发送 `finish_reason=stop`
 - 默认最多执行 3 次协议纠正（可用 `AGENT_TURN_MAX_ATTEMPTS` 配置为 2–6）；耗尽后非流式请求返回真正的 HTTP 429/503，已经建立的 SSE 则发送标准错误帧和 `[DONE]`，两者都不会伪造 `finish_reason=stop`
-- 流式请求立即建立真正的 SSE，实时发送 `reasoning_content`，并用 SSE 注释帧保活；非流式门禁仍使用 HTTP `102 Processing` 保活，以保留最终真实状态码
+- 流式请求立即建立真正的 SSE，按上游节奏分别发送 `reasoning_content` 和正式 `content`，并用 SSE 注释帧保活；非流式门禁仍使用 HTTP `102 Processing` 保活，以保留最终真实状态码
 - 协议纠正会复用同一个 Qwen `chatId`，并使用主回答（`response_index=0`）的 `response_id` 作为下一次 `parentId`，避免一次回合制造多个 `New chat`
 - thinking 通道若只包含一个完整、合法的工具调用块，也会安全转换为标准 OpenAI `tool_calls`，不会因“只有思考”而中断 Agent
 - Qwen Web 以干净 HTTP EOF 正常结束时会正确映射为 `stop` / `tool_calls`；只有连接重置等真实传输异常才返回流错误

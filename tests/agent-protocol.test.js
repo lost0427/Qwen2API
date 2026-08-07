@@ -26,7 +26,8 @@ const {
 } = require('../src/middlewares/chat-middleware.js')
 const {
   buildAgentTurnDirective,
-  parseAgentControlText
+  parseAgentControlText,
+  createAgentControlStreamParser
 } = require('../src/utils/agent-turn.js')
 
 test.after(() => {
@@ -351,6 +352,77 @@ test('strict OpenAI Agent stream exposes thinking incrementally before the gated
   assert.match(res.output, /"name":"read_file"/)
   assert.match(res.output, /"finish_reason":"tool_calls"/)
   assert.match(res.output, /\[DONE\]/)
+})
+
+test('strict OpenAI Agent stream exposes formal content before the final wrapper closes', async () => {
+  let releaseUpstream
+  let liveContentYielded
+  const liveContentWasYielded = new Promise(resolve => { liveContentYielded = resolve })
+  const upstream = Readable.from((async function * () {
+    yield 'data: {"choices":[{"delta":{"phase":"answer","content":"<agent_f"},"finish_reason":null}]}\n\n'
+    yield 'data: {"choices":[{"delta":{"phase":"answer","content":"inal>live final "},"finish_reason":null}]}\n\n'
+    liveContentYielded()
+    await new Promise(resolve => { releaseUpstream = resolve })
+    yield 'data: {"choices":[{"delta":{"phase":"answer","content":"continues</agent_final>"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+  })())
+  const res = createMockResponse()
+
+  const responsePromise = handleStreamResponse(
+    res,
+    upstream,
+    false,
+    false,
+    { messages: [{ role: 'user', content: 'finish the task' }] },
+    {
+      has_tools: true,
+      tool_choice: 'auto',
+      allowed_tool_names: ['read_file']
+    }
+  )
+
+  await liveContentWasYielded
+  await new Promise(resolve => setImmediate(resolve))
+  assert.match(res.output, /"content":"live final"/)
+  assert.doesNotMatch(res.output, /"finish_reason":"stop"/)
+  assert.equal(res.writableEnded, false)
+
+  releaseUpstream()
+  await responsePromise
+  const content = res.output
+    .split('\n\n')
+    .filter(frame => frame.startsWith('data: {'))
+    .map(frame => JSON.parse(frame.slice(6)).choices?.[0]?.delta?.content || '')
+    .join('')
+  assert.equal(content, 'live final continues')
+  assert.match(res.output, /"finish_reason":"stop"/)
+  assert.match(res.output, /\[DONE\]/)
+  assert.doesNotMatch(res.output, /agent_final/)
+})
+
+test('a malformed final wrapper cannot retry after formal content was streamed', async () => {
+  let retries = 0
+  const res = createMockResponse()
+  await handleStreamResponse(
+    res,
+    Readable.from([
+      'data: {"choices":[{"delta":{"phase":"answer","content":"<agent_final>committed partial"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+    ]),
+    false,
+    false,
+    { messages: [{ role: 'user', content: 'finish the task' }] },
+    {
+      has_tools: true,
+      tool_choice: 'auto',
+      allowed_tool_names: ['read_file'],
+      sendChatRequest: async () => { retries += 1 }
+    }
+  )
+
+  assert.equal(retries, 0)
+  assert.match(res.output, /"content":"committed partial"/)
+  assert.match(res.output, /upstream_agent_stream_invalidated/)
+  assert.match(res.output, /\[DONE\]/)
+  assert.doesNotMatch(res.output, /"finish_reason":"stop"/)
 })
 
 test('strict OpenAI Agent gate preserves max-token termination without synthetic retries', async () => {
@@ -792,6 +864,25 @@ test('Agent completion control parser rejects bare and mixed completion claims',
   assert.deepEqual(parseAgentControlText('<agent_final>done</agent_final>'), { kind: 'final', text: 'done' })
   assert.equal(parseAgentControlText('done').kind, 'bare')
   assert.equal(parseAgentControlText('prefix <agent_final>done</agent_final>').kind, 'invalid_control')
+})
+
+test('Agent completion control stream parser handles split tags and trims only wrapper edges', () => {
+  const parser = createAgentControlStreamParser()
+  const deltas = [
+    parser.push('  <agent_'),
+    parser.push('blocked>  need '),
+    parser.push('user input  </agent_'),
+    parser.push('blocked>  '),
+    parser.flush()
+  ]
+  assert.equal(deltas.map(item => item.textDelta).join(''), 'need user input')
+  assert.equal(deltas.at(-1).kind, 'blocked')
+  assert.equal(deltas.at(-1).closed, true)
+  assert.equal(deltas.at(-1).invalid, false)
+
+  const invalid = createAgentControlStreamParser()
+  assert.equal(invalid.push('bare response').textDelta, '')
+  assert.equal(invalid.flush().invalid, true)
 })
 
 test('Qwen HTTP-200 WAF payload is surfaced as an explicit failure', () => {
