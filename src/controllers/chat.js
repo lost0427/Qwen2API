@@ -1,12 +1,47 @@
 const { isJson, generateUUID } = require('../utils/tools.js')
 const { createUsageObject } = require('../utils/precise-tokenizer.js')
 const { sendChatRequest } = require('../utils/request.js')
-const { createToolCallStreamParser, parseToolCallsFromText } = require('../utils/tool-prompt.js')
+const {
+    createToolCallStreamParser,
+    parseToolCallsFromText,
+    createNativeToolCallAccumulator,
+    looksLikeUnexecutedToolAction
+} = require('../utils/tool-prompt.js')
+const { consumeSSEStream, createUpstreamResponseFilter } = require('../utils/sse.js')
 const accountManager = require('../utils/account.js')
 const config = require('../config/index.js')
-const axios = require('axios')
 const { logger } = require('../utils/logger')
 const { createUpstreamDeltaNormalizer } = require('../utils/chat-helpers.js')
+const { assertNoUpstreamFailure } = require('../utils/upstream-error.js')
+const { runOpenAIAgentTurn } = require('../utils/openai-agent-runtime.js')
+
+const normalizeOpenAIFinishReason = (upstreamReason, hasToolCalls, upstreamCompleted) => {
+    if (hasToolCalls) return 'tool_calls'
+    if (typeof upstreamReason === 'string' && upstreamReason.length > 0) {
+        const aliases = {
+            end_turn: 'stop',
+            max_tokens: 'length',
+            tool_use: 'tool_calls'
+        }
+        const normalized = aliases[upstreamReason] || upstreamReason
+        const supported = new Set(['stop', 'length', 'tool_calls', 'content_filter', 'function_call'])
+        return supported.has(normalized) ? normalized : null
+    }
+    return upstreamCompleted ? 'stop' : null
+}
+
+const writeOpenAIStreamError = (res, message, code = 'upstream_incomplete') => {
+    res.write(`data: ${JSON.stringify({
+        error: {
+            message,
+            type: 'upstream_stream_error',
+            code
+        }
+    })}\n\n`)
+    res.write('data: [DONE]\n\n')
+    if (typeof res.flush === 'function') res.flush()
+    res.end()
+}
 
 /**
  * 设置响应头
@@ -18,8 +53,9 @@ const setResponseHeaders = (res, stream) => {
         if (stream) {
             res.set({
                 'Content-Type': 'text/event-stream',
-                'Cache-Control': 'no-cache',
+                'Cache-Control': 'no-cache, no-transform',
                 'Connection': 'keep-alive',
+                'X-Accel-Buffering': 'no',
             })
         } else {
             res.set({
@@ -70,6 +106,40 @@ const buildRequiredRetryHint = (toolChoice) => {
     return 'You did not call any tool in your previous reply. You MUST now call exactly one tool using the <tool_call>...</tool_call> format and nothing else.'
 }
 
+const buildEmptyOutputRetryHint = () => [
+    'Your previous reply produced no visible final answer or executable tool call.',
+    'Continue the Agent task now. If any action remains, emit the required `<tool_call>` block immediately with no preamble.',
+    'Only give a normal final answer when the task is actually complete; do not repeat hidden reasoning.'
+].join(' ')
+
+const buildMissingToolRetryHint = () => [
+    'Your previous reply described an action but did not execute any tool call.',
+    'Perform that action now by emitting the real `<tool_call>` block immediately with no preamble.',
+    'Do not describe the action again or claim completion without a tool result.'
+].join(' ')
+
+const appendRetryHintToRequestBody = (requestBody, hint) => {
+    const messages = Array.isArray(requestBody?.messages)
+        ? requestBody.messages.map(message => ({ ...message }))
+        : []
+    if (messages.length === 0) {
+        messages.push({ role: 'user', content: hint })
+    } else {
+        const last = messages[messages.length - 1]
+        if (typeof last.content === 'string') {
+            last.content = `${last.content}\n\n# Tool-call retry\n${hint}`
+        } else if (Array.isArray(last.content)) {
+            const textPart = last.content.find(part => part?.type === 'text')
+            if (textPart) {
+                textPart.text = `${textPart.text || ''}\n\n# Tool-call retry\n${hint}`
+            } else {
+                last.content = [{ type: 'text', text: hint }, ...last.content]
+            }
+        }
+    }
+    return { ...requestBody, messages }
+}
+
 /**
  * 处理流式响应
  * @param {object} res - Express 响应对象
@@ -98,19 +168,343 @@ const attributeChatUsage = (account, usage) => {
     }
 }
 
+const writeOpenAIHttpError = (res, error = {}) => {
+    const status = Number(error.status) || 502
+    const message = error.message || '上游未能生成有效响应'
+    const code = error.code || 'upstream_error'
+    if (res.headersSent) {
+        if (!res.writableEnded) writeOpenAIStreamError(res, message, code)
+        return
+    }
+    res.status(status)
+    res.set({ 'Content-Type': 'application/json' })
+    res.json({
+        error: {
+            message,
+            type: status === 429 ? 'rate_limit_error' : 'upstream_error',
+            code
+        }
+    })
+}
+
+const runWithProcessingHeartbeat = async (res, work, intervalMs = 15000) => {
+    if (typeof res?.writeProcessing !== 'function') return work()
+    const heartbeatMs = Math.max(1, Number(intervalMs) || 15000)
+    const heartbeat = setInterval(() => {
+        if (res.headersSent || res.writableEnded || res.destroyed) return
+        try {
+            // 102 是临时响应，不会提交最终状态码/响应头。这样既能保持长 thinking
+            // 连接活跃，又能在门禁耗尽时返回真正的 HTTP 429/503。
+            res.writeProcessing()
+        } catch (_) {
+            // 某些 HTTP/2/反代适配器不实现临时响应；跳过即可，不能改发 SSE 注释。
+        }
+    }, heartbeatMs)
+    heartbeat.unref?.()
+    try {
+        return await work()
+    } finally {
+        clearInterval(heartbeat)
+    }
+}
+
+const runWithSSEHeartbeat = async (res, work, intervalMs = 15000) => {
+    const heartbeatMs = Math.max(1, Number(intervalMs) || 15000)
+    const heartbeat = setInterval(() => {
+        if (res.writableEnded || res.destroyed) return
+        try {
+            // SSE 已经提交 200 响应后，用注释帧保活。注释不会进入 OpenAI delta，
+            // 但能阻止反代在长 thinking 或纠正 attempt 期间把连接判为空闲。
+            res.write(': qwen2api-agent-keepalive\n\n')
+            if (typeof res.flush === 'function') res.flush()
+        } catch (_) {
+            // 客户端断开会由后续流消费/写入路径统一收敛。
+        }
+    }, heartbeatMs)
+    heartbeat.unref?.()
+    try {
+        return await work()
+    } finally {
+        clearInterval(heartbeat)
+    }
+}
+
+const normalizeAgentUsage = (attempt, requestBody, completionText) => {
+    let usage = { ...(attempt?.totalTokens || {}) }
+    if (!usage.prompt_tokens && !usage.completion_tokens) {
+        usage = createUsageObject(requestBody?.messages || [], completionText, null)
+    }
+    usage.prompt_tokens = Math.max(0, Number(usage.prompt_tokens) || 0)
+    usage.completion_tokens = Math.max(0, Number(usage.completion_tokens) || 0)
+    usage.total_tokens = usage.prompt_tokens + usage.completion_tokens
+    return usage
+}
+
+const prepareAgentOutput = async (attempt, enableThinking, enableWebSearch) => {
+    let reasoning = String(attempt?.reasoning || '')
+    let content = attempt?.toolCalls?.length > 0 ? '' : String(attempt?.visibleText || '')
+
+    if (attempt?.webSearchInfo) {
+        const table = await accountManager.generateMarkdownTable(attempt.webSearchInfo, config.searchInfoMode)
+        if (enableThinking && reasoning) reasoning = `${table}\n\n${reasoning}`
+        else if (enableWebSearch && config.searchInfoMode === 'text') {
+            content = `${content}${content ? '\n\n' : ''}---\n${table}`
+        }
+    }
+
+    if (config.legacyReasoningInContent && reasoning) {
+        content = `<think>\n\n${reasoning}\n\n</think>${content ? `\n${content}` : ''}`
+        reasoning = ''
+    }
+    return { reasoning, content }
+}
+
+const handleOpenAIAgentStream = async (
+    res,
+    response,
+    enableThinking,
+    enableWebSearch,
+    requestBody,
+    options
+) => {
+    setResponseHeaders(res, true)
+    const messageId = generateUUID()
+    const created = Math.round(Date.now() / 1000)
+    let firstDelta = true
+    const writeDelta = (delta) => {
+        if (!delta || Object.keys(delta).length === 0) return
+        const normalizedDelta = firstDelta ? { role: 'assistant', ...delta } : delta
+        firstDelta = false
+        res.write(`data: ${JSON.stringify({
+            id: `chatcmpl-${messageId}`,
+            object: 'chat.completion.chunk',
+            created,
+            choices: [{ index: 0, delta: normalizedDelta, finish_reason: null }]
+        })}\n\n`)
+        if (typeof res.flush === 'function') res.flush()
+    }
+
+    // 立即提交标准 SSE 首帧，不能等整个上游 attempt 收完后才让客户端看到响应。
+    // 裸正文/工具调用仍由下方门禁缓冲；安全思考与已确认进入 final/blocked
+    // 包装体的正式正文会按上游节奏增量输出。
+    if (typeof res.flushHeaders === 'function') res.flushHeaders()
+    writeDelta({ role: 'assistant' })
+
+    const liveReasoningByAttempt = new Map()
+    const onReasoningDelta = enableThinking && !config.legacyReasoningInContent
+        ? async (text, metadata = {}) => {
+            const attemptNumber = Math.max(1, Number(metadata.attemptNumber) || 1)
+            if (!liveReasoningByAttempt.has(attemptNumber)) {
+                liveReasoningByAttempt.set(attemptNumber, '')
+            }
+            if (text) {
+                liveReasoningByAttempt.set(
+                    attemptNumber,
+                    `${liveReasoningByAttempt.get(attemptNumber)}${text}`
+                )
+                writeDelta({ reasoning_content: text })
+            }
+        }
+        : null
+    const onContentDelta = !config.legacyReasoningInContent
+        ? async (text) => {
+            if (text) writeDelta({ content: text })
+        }
+        : null
+
+    let runtime
+    try {
+        runtime = await runWithSSEHeartbeat(
+            res,
+            () => runOpenAIAgentTurn(response, {
+                ...options,
+                requestBody,
+                sendChatRequest: options.sendChatRequest || sendChatRequest,
+                on_reasoning_delta: onReasoningDelta,
+                on_content_delta: onContentDelta
+            }),
+            options.agent_processing_heartbeat_ms
+        )
+    } catch (error) {
+        logger.error('OpenAI Agent 回合处理失败', 'AGENT', '', error)
+        writeOpenAIHttpError(res, {
+            status: 502,
+            message: error.publicMessage || '上游 Agent 回合处理失败',
+            code: error.code || 'upstream_stream_error'
+        })
+        return
+    }
+    if (!runtime.ok) {
+        writeOpenAIHttpError(res, runtime.error)
+        return
+    }
+
+    const { attempt, finishReason } = runtime
+    const output = await prepareAgentOutput(attempt, enableThinking, enableWebSearch)
+    let bufferedReasoning = output.reasoning
+    const acceptedReasoningWasStreamed = liveReasoningByAttempt.has(runtime.attempts)
+    const rawAcceptedReasoning = String(attempt.reasoning || '')
+    if (acceptedReasoningWasStreamed && rawAcceptedReasoning && bufferedReasoning.endsWith(rawAcceptedReasoning)) {
+        // 已实时发送的安全思考不能在门禁通过后再重复回放。若前面附加了搜索表格，
+        // 只补发这一段派生前缀。
+        bufferedReasoning = bufferedReasoning.slice(0, -rawAcceptedReasoning.length)
+    }
+
+    let bufferedContent = output.content
+    const streamedVisibleText = String(attempt.streamedVisibleText || '')
+    const acceptedVisibleText = String(attempt.visibleText || '')
+    if (
+        streamedVisibleText &&
+        acceptedVisibleText.startsWith(streamedVisibleText) &&
+        bufferedContent.startsWith(acceptedVisibleText)
+    ) {
+        // 正式回复的包装体已经按上游节奏实时发送，只补发极少数尚未发送的尾部，
+        // 以及门禁通过后追加的搜索信息等派生内容。
+        bufferedContent = `${acceptedVisibleText.slice(streamedVisibleText.length)}${bufferedContent.slice(acceptedVisibleText.length)}`
+    } else if (streamedVisibleText && finishReason !== 'stop' && attempt.streamedControlState?.opened) {
+        // length/content_filter 等中止发生在包装闭合前时，不能把带控制标签的原始
+        // 缓冲再次作为正文回放；已发送的安全正文由对应 finish_reason 正常收尾。
+        bufferedContent = ''
+    }
+
+    if (bufferedReasoning) writeDelta({ reasoning_content: bufferedReasoning })
+    if (bufferedContent) writeDelta({ content: bufferedContent })
+
+    const ARG_CHUNK_SIZE = 32
+    for (const call of attempt.toolCalls || []) {
+        writeDelta({
+            tool_calls: [{
+                index: call.index,
+                id: call.id,
+                type: 'function',
+                function: { name: call.function.name, arguments: '' }
+            }]
+        })
+        const args = call.function.arguments || '{}'
+        for (let offset = 0; offset < args.length; offset += ARG_CHUNK_SIZE) {
+            writeDelta({
+                tool_calls: [{
+                    index: call.index,
+                    function: { arguments: args.slice(offset, offset + ARG_CHUNK_SIZE) }
+                }]
+            })
+        }
+    }
+    const completionText = `${output.reasoning}${output.content}${JSON.stringify(attempt.toolCalls || [])}`
+    const usage = normalizeAgentUsage(attempt, requestBody, completionText)
+    attributeChatUsage(options.currentAccount, usage)
+    res.write(`data: ${JSON.stringify({
+        id: `chatcmpl-${messageId}`,
+        object: 'chat.completion.chunk',
+        created,
+        choices: [{ index: 0, delta: {}, finish_reason: finishReason }]
+    })}\n\n`)
+    res.write(`data: ${JSON.stringify({
+        id: `chatcmpl-${messageId}`,
+        object: 'chat.completion.chunk',
+        created,
+        choices: [],
+        usage
+    })}\n\n`)
+    res.write('data: [DONE]\n\n')
+    if (typeof res.flush === 'function') res.flush()
+    res.end()
+}
+
+const handleOpenAIAgentNonStream = async (
+    res,
+    response,
+    enableThinking,
+    enableWebSearch,
+    model,
+    requestBody,
+    options
+) => {
+    let runtime
+    try {
+        runtime = await runWithProcessingHeartbeat(
+            res,
+            () => runOpenAIAgentTurn(response, {
+                ...options,
+                requestBody,
+                sendChatRequest: options.sendChatRequest || sendChatRequest
+            }),
+            options.agent_processing_heartbeat_ms
+        )
+    } catch (error) {
+        logger.error('OpenAI 非流式 Agent 回合处理失败', 'AGENT', '', error)
+        writeOpenAIHttpError(res, {
+            status: 502,
+            message: error.publicMessage || '上游 Agent 回合处理失败',
+            code: error.code || 'upstream_error'
+        })
+        return
+    }
+    if (!runtime.ok) {
+        writeOpenAIHttpError(res, runtime.error)
+        return
+    }
+
+    setResponseHeaders(res, false)
+    const { attempt, finishReason } = runtime
+    const output = await prepareAgentOutput(attempt, enableThinking, enableWebSearch)
+    const assistantMessage = {
+        role: 'assistant',
+        content: output.content || (attempt.toolCalls.length > 0 ? null : '')
+    }
+    if (output.reasoning) assistantMessage.reasoning_content = output.reasoning
+    if (attempt.toolCalls.length > 0) {
+        assistantMessage.tool_calls = attempt.toolCalls.map(call => ({
+            id: call.id,
+            type: 'function',
+            function: { ...call.function }
+        }))
+    }
+    const completionText = `${output.reasoning}${output.content}${JSON.stringify(attempt.toolCalls || [])}`
+    const usage = normalizeAgentUsage(attempt, requestBody, completionText)
+    attributeChatUsage(options.currentAccount, usage)
+    res.json({
+        id: `chatcmpl-${generateUUID()}`,
+        object: 'chat.completion',
+        created: Math.round(Date.now() / 1000),
+        model,
+        choices: [{ index: 0, message: assistantMessage, finish_reason: finishReason }],
+        usage
+    })
+}
+
 const handleStreamResponse = async (res, response, enable_thinking, enable_web_search, requestBody = null, options = {}) => {
+    if (options.has_tools && options.strict_agent_turn !== false) {
+        return handleOpenAIAgentStream(
+            res,
+            response,
+            enable_thinking,
+            enable_web_search,
+            requestBody,
+            options
+        )
+    }
     try {
         const message_id = generateUUID()
         let web_search_info = null
         let thinking_start = false
         let thinking_end = false
         const normalizeDelta = createUpstreamDeltaNormalizer()
+        const acceptUpstreamFrame = createUpstreamResponseFilter()
         let emittedImageMarkdownSet = new Set()
         let pendingImageMarkdownList = []
 
         const hasTools = !!options.has_tools
+        const requestSender = options.sendChatRequest || sendChatRequest
         const toolChoice = options.tool_choice
-        const toolParser = hasTools ? createToolCallStreamParser() : null
+        const allowedToolNames = options.allowed_tool_names || []
+        const toolParser = hasTools ? createToolCallStreamParser({ allowedToolNames }) : null
+        let nativeToolAccumulator = hasTools
+            ? createNativeToolCallAccumulator({ allowedToolNames })
+            : null
+        let upstreamFinishReason = null
+        let upstreamCompleted = false
+        let upstreamEventCount = 0
 
         // Token消耗量统计
         let totalTokens = {
@@ -119,6 +513,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
             total_tokens: 0
         }
         let completionContent = '' // 收集完整的回复内容用于token估算
+        let visibleContent = ''
 
         // 提取prompt文本用于token估算
         let promptText = ''
@@ -139,6 +534,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
          */
         const writeContentDelta = (text) => {
             if (!text) return
+            visibleContent += text
             res.write(`data: ${JSON.stringify({
                 "id": `chatcmpl-${message_id}`,
                 "object": "chat.completion.chunk",
@@ -258,9 +654,10 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
          */
         const processSSEPayload = async (dataContent) => {
             const decodeJson = isJson(dataContent) ? JSON.parse(dataContent) : null
-            if (decodeJson === null || !decodeJson.choices || decodeJson.choices.length === 0) {
-                return
-            }
+            if (decodeJson === null) return
+            assertNoUpstreamFailure(decodeJson)
+            // 丢弃其余候选回答的帧：上游多路并发会让内容重复
+            if (!acceptUpstreamFrame(decodeJson)) return
 
             if (decodeJson.usage) {
                 totalTokens = {
@@ -270,7 +667,24 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
                 }
             }
 
-            const delta = decodeJson.choices[0].delta
+            if (!decodeJson.choices || decodeJson.choices.length === 0) return
+
+            const choice = decodeJson.choices[0]
+            const reportedFinishReason = choice.finish_reason ?? choice.delta?.finish_reason
+            if (reportedFinishReason !== undefined && reportedFinishReason !== null) {
+                upstreamFinishReason = reportedFinishReason
+            }
+
+            const delta = choice.delta || {}
+            if (nativeToolAccumulator && Array.isArray(delta.tool_calls)) {
+                nativeToolAccumulator.push(delta.tool_calls)
+            } else if (nativeToolAccumulator && delta.function_call) {
+                nativeToolAccumulator.push([{
+                    index: 0,
+                    type: 'function',
+                    function: delta.function_call
+                }])
+            }
 
             if (delta && delta.name === 'web_search') {
                 web_search_info = delta.extra.web_search_info
@@ -369,64 +783,66 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
          * @param {object} upstreamResponse - axios stream 响应
          * @returns {Promise<void>} 流处理完成的 Promise
          */
-        const pipeUpstream = (upstreamResponse) => new Promise((resolve, reject) => {
-            const decoder = new TextDecoder('utf-8')
-            let buffer = ''
-
-            upstreamResponse.on('data', async (chunk) => {
-                const decodeText = decoder.decode(chunk, { stream: true })
-                buffer += decodeText
-
-                const chunks = []
-                let startIndex = 0
-
-                while (true) {
-                    const dataStart = buffer.indexOf('data: ', startIndex)
-                    if (dataStart === -1) break
-                    const dataEnd = buffer.indexOf('\n\n', dataStart)
-                    if (dataEnd === -1) break
-                    const dataChunk = buffer.substring(dataStart, dataEnd).trim()
-                    chunks.push(dataChunk)
-                    startIndex = dataEnd + 2
-                }
-
-                if (startIndex > 0) {
-                    buffer = buffer.substring(startIndex)
-                }
-
-                for (const item of chunks) {
-                    try {
-                        await processSSEPayload(item.replace("data: ", ''))
-                    } catch (error) {
-                        logger.error('流式数据处理错误', 'CHAT', '', error)
-                    }
+        const pipeUpstream = async (upstreamResponse) => {
+            const result = await consumeSSEStream(upstreamResponse, async (frame) => {
+                if (!frame.data || frame.data.trim() === '[DONE]') return
+                try {
+                    await processSSEPayload(frame.data)
+                } catch (error) {
+                    logger.error('流式数据处理错误', 'CHAT', '', error)
+                    throw error
                 }
             })
-
-            upstreamResponse.on('end', () => resolve())
-            upstreamResponse.on('error', (err) => reject(err))
-        })
+            upstreamCompleted = result.completed
+            upstreamEventCount = result.eventCount
+        }
 
         await pipeUpstream(response)
 
-        // tool_choice="required" 强校验：未触发任何工具调用则追加更强提示重试一次
-        if (hasTools && toolParser && !toolParser.hasEmittedAnyCall() && requiresToolCall(toolChoice)) {
-            const retryHint = buildRequiredRetryHint(toolChoice)
-            const retryBody = {
-                ...requestBody,
-                messages: [
-                    ...(Array.isArray(requestBody?.messages) ? requestBody.messages : []),
-                    { role: 'system', content: retryHint }
-                ]
-            }
-            logger.warning?.('tool_choice=required 首次未触发工具调用，进行一次重试', 'CHAT')
+        // Agent 空回合补偿：只有思考、没有正文/工具调用时自动重试一次。
+        // required 仍使用更强的指定工具提示；两个条件共用一次重试，避免重复请求。
+        const needsRequiredRetry = !!(
+            hasTools && toolParser &&
+            !toolParser.hasEmittedAnyCall() &&
+            !nativeToolAccumulator?.hasAny() &&
+            requiresToolCall(toolChoice)
+        )
+        const needsEmptyOutputRetry = !!(
+            !visibleContent.trim() &&
+            !toolParser?.hasEmittedAnyCall() &&
+            !toolParser?.hasPendingCall() &&
+            !toolParser?.hasParseError() &&
+            !nativeToolAccumulator?.hasAny() &&
+            !['length', 'max_tokens', 'content_filter', 'refusal'].includes(upstreamFinishReason)
+        )
+        const needsMissingToolRetry = !!(
+            hasTools && looksLikeUnexecutedToolAction(visibleContent) &&
+            !toolParser?.hasEmittedAnyCall() && !toolParser?.hasPendingCall() &&
+            !toolParser?.hasParseError() && !nativeToolAccumulator?.hasAny() &&
+            !['length', 'max_tokens', 'content_filter', 'refusal'].includes(upstreamFinishReason)
+        )
+        if (needsRequiredRetry || needsEmptyOutputRetry || needsMissingToolRetry) {
+            const retryHint = needsRequiredRetry
+                ? buildRequiredRetryHint(toolChoice)
+                : (needsMissingToolRetry ? buildMissingToolRetryHint() : buildEmptyOutputRetryHint())
+            const retryBody = appendRetryHintToRequestBody(requestBody, retryHint)
+            logger.warning?.(
+                needsRequiredRetry
+                    ? 'tool_choice=required 首次未触发工具调用，进行一次重试'
+                    : (needsMissingToolRetry
+                        ? 'Agent 首次响应只描述了动作但未调用工具，进行一次补偿重试'
+                        : 'Agent 首次响应没有正文或工具调用，进行一次补偿重试'),
+                'CHAT'
+            )
             try {
-                const retryResp = await sendChatRequest(retryBody)
+                const retryResp = await requestSender(retryBody)
                 if (retryResp.status && retryResp.response) {
+                    upstreamFinishReason = null
                     await pipeUpstream(retryResp.response)
                 }
             } catch (e) {
-                logger.error('required 模式重试失败', 'CHAT', '', e)
+                logger.error('Agent 补偿重试失败', 'CHAT', '', e)
+                if (e.publicMessage) throw e
             }
         }
 
@@ -435,6 +851,43 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
             const tail = toolParser.flush()
             if (tail.textDelta) writeContentDelta(tail.textDelta)
             if (tail.completedCalls.length > 0) writeToolCallsDelta(tail.completedCalls)
+        }
+
+        const nativeToolCalls = nativeToolAccumulator?.hasAny()
+            ? nativeToolAccumulator.finalize()
+            : []
+        if (nativeToolCalls.length > 0) writeToolCallsDelta(nativeToolCalls)
+
+        const hasEmittedToolCalls = !!(
+            nativeToolCalls.length > 0 ||
+            (toolParser && toolParser.hasEmittedAnyCall())
+        )
+        const hasToolProtocolError = !!(
+            !hasEmittedToolCalls &&
+            (requiresToolCall(toolChoice) ||
+                (toolParser && toolParser.hasParseError()) ||
+                (nativeToolAccumulator && nativeToolAccumulator.hasParseError()))
+        )
+        if (hasToolProtocolError) {
+            writeOpenAIStreamError(res, '上游返回了残缺、非法或不存在的工具调用', 'invalid_tool_call')
+            return
+        }
+
+        if (!visibleContent.trim() && !hasEmittedToolCalls &&
+            !['length', 'max_tokens', 'content_filter', 'refusal'].includes(upstreamFinishReason)) {
+            writeOpenAIStreamError(res, '上游重试后仍未返回正文或工具调用', 'upstream_empty_output')
+            return
+        }
+
+        const finishReason = normalizeOpenAIFinishReason(
+            upstreamFinishReason,
+            hasEmittedToolCalls,
+            upstreamCompleted
+        )
+        if (!finishReason) {
+            const detail = upstreamEventCount === 0 ? '上游未返回任何 SSE 事件' : '上游流在结束标记前断开'
+            writeOpenAIStreamError(res, detail, 'upstream_incomplete')
+            return
         }
 
         // 处理最终的搜索信息
@@ -465,7 +918,6 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
         // 全归属主账户是可接受的精度损失（PR #3wg.1 epic notes 已记）
         attributeChatUsage(options.currentAccount, totalTokens)
 
-        const finishReason = (toolParser && toolParser.hasEmittedAnyCall()) ? 'tool_calls' : 'stop'
         res.write(`data: ${JSON.stringify({
             "id": `chatcmpl-${message_id}`,
             "object": "chat.completion.chunk",
@@ -491,7 +943,23 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
         res.end()
     } catch (error) {
         logger.error('聊天处理错误', 'CHAT', '', error)
-        try { res.status(500).json({ error: "Service error" }) } catch (_) { /* response already started */ }
+        if (res.headersSent) {
+            if (!res.writableEnded) {
+                writeOpenAIStreamError(
+                    res,
+                    error.publicMessage || '上游流式传输失败',
+                    error.publicMessage ? error.code : 'upstream_stream_error'
+                )
+            }
+        } else {
+            res.status(502).json({
+                error: {
+                    message: error.publicMessage || '上游流式传输失败',
+                    type: 'upstream_stream_error',
+                    code: error.code || 'upstream_stream_error'
+                }
+            })
+        }
     }
 }
 
@@ -507,6 +975,17 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
  * @param {boolean} [options.has_tools] - 是否启用工具调用解析
  */
 const handleNonStreamResponse = async (res, response, enable_thinking, enable_web_search, model, requestBody = null, options = {}) => {
+    if (options.has_tools && options.strict_agent_turn !== false) {
+        return handleOpenAIAgentNonStream(
+            res,
+            response,
+            enable_thinking,
+            enable_web_search,
+            model,
+            requestBody,
+            options
+        )
+    }
     try {
         let fullContent = ''
         let fullReasoning = '' // 新版模式下累积的推理内容（reasoning_content）
@@ -514,11 +993,20 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
         let thinking_start = false
         let thinking_end = false
         const normalizeDelta = createUpstreamDeltaNormalizer()
+        const acceptUpstreamFrame = createUpstreamResponseFilter()
         let appendedImageMarkdownSet = new Set()
         let pendingImageMarkdownList = []
 
         const hasTools = !!options.has_tools
+        const requestSender = options.sendChatRequest || sendChatRequest
         const toolChoice = options.tool_choice
+        const allowedToolNames = options.allowed_tool_names || []
+        let nativeToolAccumulator = hasTools
+            ? createNativeToolCallAccumulator({ allowedToolNames })
+            : null
+        let upstreamFinishReason = null
+        let upstreamCompleted = false
+        let upstreamEventCount = 0
 
         // Token消耗量统计
         let totalTokens = {
@@ -545,168 +1033,220 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
          * @param {object} upstreamResponse - axios stream 响应
          * @returns {Promise<void>} 流处理完成的 Promise
          */
-        const accumulateUpstream = (upstreamResponse) => new Promise((resolve, reject) => {
-            const decoder = new TextDecoder('utf-8')
-            let buffer = ''
+        const processAccumulatedPayload = async (dataContent) => {
+            const decodeJson = isJson(dataContent) ? JSON.parse(dataContent) : null
+            if (decodeJson === null) return
+            assertNoUpstreamFailure(decodeJson)
+            // 丢弃其余候选回答的帧：上游多路并发会让内容重复
+            if (!acceptUpstreamFrame(decodeJson)) return
 
-            upstreamResponse.on('data', async (chunk) => {
-                const decodeText = decoder.decode(chunk, { stream: true })
-                buffer += decodeText
-
-                const chunks = []
-                let startIndex = 0
-
-                while (true) {
-                    const dataStart = buffer.indexOf('data: ', startIndex)
-                    if (dataStart === -1) break
-                    const dataEnd = buffer.indexOf('\n\n', dataStart)
-                    if (dataEnd === -1) break
-                    const dataChunk = buffer.substring(dataStart, dataEnd).trim()
-                    chunks.push(dataChunk)
-                    startIndex = dataEnd + 2
+            if (decodeJson.usage) {
+                totalTokens = {
+                    prompt_tokens: decodeJson.usage.prompt_tokens || totalTokens.prompt_tokens,
+                    completion_tokens: decodeJson.usage.completion_tokens || totalTokens.completion_tokens,
+                    total_tokens: decodeJson.usage.total_tokens || totalTokens.total_tokens
                 }
+            }
+            if (!decodeJson.choices || decodeJson.choices.length === 0) return
 
-                if (startIndex > 0) {
-                    buffer = buffer.substring(startIndex)
+            const choice = decodeJson.choices[0]
+            const reportedFinishReason = choice.finish_reason ?? choice.delta?.finish_reason
+            if (reportedFinishReason !== undefined && reportedFinishReason !== null) {
+                upstreamFinishReason = reportedFinishReason
+            }
+            const delta = choice.delta || {}
+            if (nativeToolAccumulator && Array.isArray(delta.tool_calls)) {
+                nativeToolAccumulator.push(delta.tool_calls)
+            } else if (nativeToolAccumulator && delta.function_call) {
+                nativeToolAccumulator.push([{ index: 0, type: 'function', function: delta.function_call }])
+            }
+
+            if (delta.name === 'web_search') {
+                web_search_info = delta.extra?.web_search_info
+            }
+
+            const imageMarkdownList = getImageMarkdownListFromDelta(delta)
+            if (imageMarkdownList.length > 0) {
+                const newImageMarkdownList = imageMarkdownList.filter(it => !appendedImageMarkdownSet.has(it))
+                if (thinking_start && !thinking_end) {
+                    for (const imageMarkdown of newImageMarkdownList) {
+                        if (!pendingImageMarkdownList.includes(imageMarkdown)) pendingImageMarkdownList.push(imageMarkdown)
+                    }
+                } else if (newImageMarkdownList.length > 0) {
+                    fullContent += `${newImageMarkdownList.join('\n\n')}\n\n`
+                    newImageMarkdownList.forEach(it => appendedImageMarkdownSet.add(it))
                 }
+            }
 
-                for (const item of chunks) {
-                    try {
-                        const dataContent = item.replace("data: ", '')
-                        const decodeJson = isJson(dataContent) ? JSON.parse(dataContent) : null
-                        if (decodeJson === null || !decodeJson.choices || decodeJson.choices.length === 0) {
-                            continue
-                        }
+            const normalized = normalizeDelta(delta)
+            if (!normalized) return
+            delta.phase = normalized.phase
+            let content = normalized.content
 
-                        if (decodeJson.usage) {
-                            totalTokens = {
-                                prompt_tokens: decodeJson.usage.prompt_tokens || totalTokens.prompt_tokens,
-                                completion_tokens: decodeJson.usage.completion_tokens || totalTokens.completion_tokens,
-                                total_tokens: decodeJson.usage.total_tokens || totalTokens.total_tokens
-                            }
-                        }
-
-                        const delta = decodeJson.choices[0].delta
-
-                        if (delta && delta.name === 'web_search') {
-                            web_search_info = delta.extra.web_search_info
-                        }
-
-                        const imageMarkdownList = getImageMarkdownListFromDelta(delta)
-                        if (imageMarkdownList.length > 0) {
-                            const newImageMarkdownList = imageMarkdownList.filter(it => !appendedImageMarkdownSet.has(it))
-
-                            if (thinking_start && !thinking_end) {
-                                for (const imageMarkdown of newImageMarkdownList) {
-                                    if (!pendingImageMarkdownList.includes(imageMarkdown)) {
-                                        pendingImageMarkdownList.push(imageMarkdown)
-                                    }
-                                }
-                            } else if (newImageMarkdownList.length > 0) {
-                                fullContent += `${newImageMarkdownList.join('\n\n')}\n\n`
-                                newImageMarkdownList.forEach(it => appendedImageMarkdownSet.add(it))
-                            }
-                        }
-
-                        const normalized = normalizeDelta(delta)
-                        if (!normalized) {
-                            continue
-                        }
-                        delta.phase = normalized.phase
-                        let content = normalized.content
-
-                        if (config.legacyReasoningInContent) {
-                            // 旧版：推理以 <think>...</think> 包裹并入 content
-                            if (delta.phase === 'think' && !thinking_start) {
-                                thinking_start = true
-                                if (web_search_info) {
-                                    const webSearchTable = await accountManager.generateMarkdownTable(web_search_info, config.searchInfoMode)
-                                    content = `<think>\n\n${webSearchTable}\n\n${content}`
-                                } else {
-                                    content = `<think>\n\n${content}`
-                                }
-                            }
-                            if (delta.phase === 'answer' && !thinking_end && thinking_start) {
-                                thinking_end = true
-                                if (pendingImageMarkdownList.length > 0) {
-                                    content = `\n\n</think>\n${pendingImageMarkdownList.join('\n\n')}\n\n${content}`
-                                    pendingImageMarkdownList.forEach(it => appendedImageMarkdownSet.add(it))
-                                    pendingImageMarkdownList = []
-                                } else {
-                                    content = `\n\n</think>\n${content}`
-                                }
-                            }
-                            fullContent += content
-                        } else if (delta.phase === 'think') {
-                            // 新版：推理累积到 reasoning_content
-                            if (!thinking_start && web_search_info) {
-                                const webSearchTable = await accountManager.generateMarkdownTable(web_search_info, config.searchInfoMode)
-                                content = `${webSearchTable}\n\n${content}`
-                            }
-                            thinking_start = true
-                            fullReasoning += content
-                        } else {
-                            // 新版 answer 阶段：先冲刷缓存图片，再累积正文
-                            if (!thinking_end && thinking_start) {
-                                thinking_end = true
-                                if (pendingImageMarkdownList.length > 0) {
-                                    fullContent += `${pendingImageMarkdownList.join('\n\n')}\n\n`
-                                    pendingImageMarkdownList.forEach(it => appendedImageMarkdownSet.add(it))
-                                    pendingImageMarkdownList = []
-                                }
-                            }
-                            fullContent += content
-                        }
-                    } catch (error) {
-                        logger.error('非流式数据处理错误', 'CHAT', '', error)
+            if (config.legacyReasoningInContent) {
+                if (delta.phase === 'think' && !thinking_start) {
+                    thinking_start = true
+                    if (web_search_info) {
+                        const webSearchTable = await accountManager.generateMarkdownTable(web_search_info, config.searchInfoMode)
+                        content = `<think>\n\n${webSearchTable}\n\n${content}`
+                    } else {
+                        content = `<think>\n\n${content}`
                     }
                 }
-            })
+                if (delta.phase === 'answer' && !thinking_end && thinking_start) {
+                    thinking_end = true
+                    if (pendingImageMarkdownList.length > 0) {
+                        content = `\n\n</think>\n${pendingImageMarkdownList.join('\n\n')}\n\n${content}`
+                        pendingImageMarkdownList.forEach(it => appendedImageMarkdownSet.add(it))
+                        pendingImageMarkdownList = []
+                    } else {
+                        content = `\n\n</think>\n${content}`
+                    }
+                }
+                fullContent += content
+            } else if (delta.phase === 'think') {
+                if (!thinking_start && web_search_info) {
+                    const webSearchTable = await accountManager.generateMarkdownTable(web_search_info, config.searchInfoMode)
+                    content = `${webSearchTable}\n\n${content}`
+                }
+                thinking_start = true
+                fullReasoning += content
+            } else {
+                if (!thinking_end && thinking_start) {
+                    thinking_end = true
+                    if (pendingImageMarkdownList.length > 0) {
+                        fullContent += `${pendingImageMarkdownList.join('\n\n')}\n\n`
+                        pendingImageMarkdownList.forEach(it => appendedImageMarkdownSet.add(it))
+                        pendingImageMarkdownList = []
+                    }
+                }
+                fullContent += content
+            }
+        }
 
-            upstreamResponse.on('end', () => resolve())
-            upstreamResponse.on('error', (err) => {
-                logger.error('非流式响应流读取错误', 'CHAT', '', err)
-                reject(err)
+        const accumulateUpstream = async (upstreamResponse) => {
+            const result = await consumeSSEStream(upstreamResponse, async (frame) => {
+                if (!frame.data || frame.data.trim() === '[DONE]') return
+                await processAccumulatedPayload(frame.data)
             })
-        })
+            upstreamCompleted = result.completed
+            upstreamEventCount = result.eventCount
+        }
 
         await accumulateUpstream(response)
 
-        // 工具调用解析：从 fullContent 抽取 <tool_call> 块
-        let assistantContent = fullContent
-        let toolCalls = []
-        if (hasTools) {
-            const parsed = parseToolCallsFromText(fullContent)
-            assistantContent = parsed.cleanedText
-            toolCalls = parsed.toolCalls
+        if (!upstreamCompleted && !upstreamFinishReason) {
+            const detail = upstreamEventCount === 0 ? '上游未返回任何 SSE 事件' : '上游流在结束标记前断开'
+            return res.status(502).json({
+                error: { message: detail, type: 'upstream_stream_error', code: 'upstream_incomplete' }
+            })
         }
 
-        // tool_choice="required" 强校验：未触发则重试一次
-        if (hasTools && toolCalls.length === 0 && requiresToolCall(toolChoice)) {
-            const retryHint = buildRequiredRetryHint(toolChoice)
-            const retryBody = {
-                ...requestBody,
-                messages: [
-                    ...(Array.isArray(requestBody?.messages) ? requestBody.messages : []),
-                    { role: 'system', content: retryHint }
-                ]
-            }
-            logger.warning?.('tool_choice=required 首次未触发工具调用，进行一次重试', 'CHAT')
+        // 同时支持提示词/XML 工具调用与上游原生 delta.tool_calls。
+        let assistantContent = fullContent
+        let toolCalls = []
+        let toolErrors = []
+        if (hasTools) {
+            const parsed = parseToolCallsFromText(fullContent, { allowedToolNames })
+            const nativeCalls = nativeToolAccumulator?.hasAny() ? nativeToolAccumulator.finalize() : []
+            assistantContent = parsed.cleanedText
+            toolCalls = [...nativeCalls, ...parsed.toolCalls].map((call, index) => ({ ...call, index }))
+            toolErrors = [
+                ...parsed.errors,
+                ...(nativeToolAccumulator?.getErrors() || [])
+            ]
+        }
+
+        // required 未调用，或只有思考没有可见输出时，共用一次补偿重试。
+        const needsRequiredRetry = hasTools && toolCalls.length === 0 && requiresToolCall(toolChoice)
+        const needsEmptyOutputRetry = toolCalls.length === 0 && toolErrors.length === 0 && !assistantContent.trim() &&
+            !['length', 'max_tokens', 'content_filter', 'refusal'].includes(upstreamFinishReason)
+        const needsMissingToolRetry = hasTools && toolCalls.length === 0 && toolErrors.length === 0 &&
+            looksLikeUnexecutedToolAction(assistantContent) &&
+            !['length', 'max_tokens', 'content_filter', 'refusal'].includes(upstreamFinishReason)
+        if (needsRequiredRetry || needsEmptyOutputRetry || needsMissingToolRetry) {
+            const retryHint = needsRequiredRetry
+                ? buildRequiredRetryHint(toolChoice)
+                : (needsMissingToolRetry ? buildMissingToolRetryHint() : buildEmptyOutputRetryHint())
+            const retryBody = appendRetryHintToRequestBody(requestBody, retryHint)
+            logger.warning?.(
+                needsRequiredRetry
+                    ? 'tool_choice=required 首次未触发工具调用，进行一次重试'
+                    : (needsMissingToolRetry
+                        ? 'Agent 首次响应只描述了动作但未调用工具，进行一次补偿重试'
+                        : 'Agent 首次响应没有正文或工具调用，进行一次补偿重试'),
+                'CHAT'
+            )
             try {
-                const retryResp = await sendChatRequest(retryBody)
+                const retryResp = await requestSender(retryBody)
                 if (retryResp.status && retryResp.response) {
                     const before = fullContent
+                    nativeToolAccumulator = createNativeToolCallAccumulator({ allowedToolNames })
+                    upstreamFinishReason = null
                     await accumulateUpstream(retryResp.response)
-                    const retriedText = fullContent.slice(before.length)
-                    const parsedRetry = parseToolCallsFromText(retriedText)
-                    if (parsedRetry.toolCalls.length > 0) {
-                        toolCalls = parsedRetry.toolCalls
-                        assistantContent = (parseToolCallsFromText(fullContent).cleanedText)
+                    if (!upstreamCompleted && !upstreamFinishReason) {
+                        return res.status(502).json({
+                            error: {
+                                message: '工具调用重试流在结束标记前断开',
+                                type: 'upstream_stream_error',
+                                code: 'upstream_incomplete'
+                            }
+                        })
                     }
+                    const retriedText = fullContent.slice(before.length)
+                    const parsedRetry = parseToolCallsFromText(retriedText, { allowedToolNames })
+                    const nativeRetryCalls = nativeToolAccumulator.hasAny()
+                        ? nativeToolAccumulator.finalize()
+                        : []
+                    toolCalls = [...nativeRetryCalls, ...parsedRetry.toolCalls]
+                        .map((call, index) => ({ ...call, index }))
+                    assistantContent = parsedRetry.cleanedText
+                    toolErrors = [
+                        ...parsedRetry.errors,
+                        ...nativeToolAccumulator.getErrors()
+                    ]
                 }
             } catch (e) {
-                logger.error('required 模式重试失败', 'CHAT', '', e)
+                logger.error('Agent 补偿重试失败', 'CHAT', '', e)
+                if (e.publicMessage) throw e
             }
+        }
+
+        if (hasTools && toolCalls.length === 0 && (toolErrors.length > 0 || requiresToolCall(toolChoice))) {
+            return res.status(502).json({
+                error: {
+                    message: '上游返回了残缺、非法或不存在的工具调用',
+                    type: 'invalid_tool_call',
+                    code: 'invalid_tool_call',
+                    details: toolErrors
+                }
+            })
+        }
+
+        if (toolCalls.length === 0 && !assistantContent.trim() &&
+            !['length', 'max_tokens', 'content_filter', 'refusal'].includes(upstreamFinishReason)) {
+            return res.status(502).json({
+                error: {
+                    message: '上游重试后仍未返回正文或工具调用',
+                    type: 'upstream_empty_output',
+                    code: 'upstream_empty_output'
+                }
+            })
+        }
+
+        const finishReason = normalizeOpenAIFinishReason(
+            upstreamFinishReason,
+            toolCalls.length > 0,
+            upstreamCompleted
+        )
+        if (!finishReason) {
+            return res.status(502).json({
+                error: {
+                    message: '上游流在结束标记前断开',
+                    type: 'upstream_stream_error',
+                    code: 'upstream_incomplete'
+                }
+            })
         }
 
         // 处理最终的搜索信息（同流式分支：新版模式思考开启时搜索表格已在 reasoning_content，不再追加到 content）
@@ -750,7 +1290,7 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
                 {
                     "index": 0,
                     "message": assistantMessage,
-                    "finish_reason": toolCalls.length > 0 ? "tool_calls" : "stop"
+                    "finish_reason": finishReason
                 }
             ],
             "usage": totalTokens
@@ -758,10 +1298,15 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
         res.json(bodyTemplate)
     } catch (error) {
         logger.error('非流式聊天处理错误', 'CHAT', '', error)
-        res.status(500)
-            .json({
-                error: "Service error"
+        if (!res.headersSent) {
+            res.status(502).json({
+                error: {
+                    message: error.publicMessage || '上游响应处理失败',
+                    type: 'upstream_error',
+                    code: error.code || 'upstream_error'
+                }
             })
+        }
     }
 }
 
@@ -783,17 +1328,37 @@ const handleChatCompletion = async (req, res) => {
         if (!response_data.status || !response_data.response) {
             res.status(500)
                 .json({
-                    error: "Request failed"
+                    error: response_data.message || "Request failed"
                 })
             return
         }
 
         if (stream) {
             setResponseHeaders(res, true)
-            await handleStreamResponse(res, response_data.response, enable_thinking, enable_web_search, req.body, { has_tools: req.has_tools, tool_choice: req.tool_choice, currentAccount: response_data.currentAccount })
+            await handleStreamResponse(res, response_data.response, enable_thinking, enable_web_search, req.body, {
+                has_tools: req.has_tools,
+                tool_choice: req.tool_choice,
+                allowed_tool_names: req.allowed_tool_names,
+                currentAccount: response_data.currentAccount,
+                upstream_request_body: response_data.requestBody,
+                upstream_context: {
+                    chatId: response_data.chatId,
+                    parentId: response_data.parentId
+                }
+            })
         } else {
             setResponseHeaders(res, false)
-            await handleNonStreamResponse(res, response_data.response, enable_thinking, enable_web_search, model, req.body, { has_tools: req.has_tools, tool_choice: req.tool_choice, currentAccount: response_data.currentAccount })
+            await handleNonStreamResponse(res, response_data.response, enable_thinking, enable_web_search, model, req.body, {
+                has_tools: req.has_tools,
+                tool_choice: req.tool_choice,
+                allowed_tool_names: req.allowed_tool_names,
+                currentAccount: response_data.currentAccount,
+                upstream_request_body: response_data.requestBody,
+                upstream_context: {
+                    chatId: response_data.chatId,
+                    parentId: response_data.parentId
+                }
+            })
         }
 
     } catch (error) {
@@ -809,5 +1374,6 @@ module.exports = {
     handleChatCompletion,
     handleStreamResponse,
     handleNonStreamResponse,
-    setResponseHeaders
+    setResponseHeaders,
+    normalizeOpenAIFinishReason
 }
