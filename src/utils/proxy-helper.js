@@ -9,6 +9,33 @@ const proxyAgents = new Map()
 // 含用户名/密码、IPv6、自定义路径的代理 URL
 const PROXY_URL_REGEX = /^(https?|socks5):\/\/[^\s]+$/i
 
+// Resin 是否已配置启用
+const isResinEnabled = () => Boolean(config.resinUrl)
+
+/**
+ * 构造该账号在 Resin 上的专属代理 URL
+ * RESIN_URL 形如 http://host:port/my-token，path 段即令牌。
+ * 账号身份 = 平台名 + '.' + 账号邮箱（邮箱在登录前就存在，天然稳定，
+ * 不会被 Resin 误判成多个网络身份）。URL 对象会按需做百分号编码
+ * （例如邮箱里的 @ 会被转义为 %40），HttpsProxyAgent 读取时会自动解码。
+ * @param {string} accountEmail - 账号邮箱
+ * @returns {string|null} Resin 代理 URL；未配置或格式非法时返回 null
+ */
+const buildResinProxyUrl = (accountEmail) => {
+    if (!isResinEnabled() || typeof accountEmail !== 'string' || !accountEmail) return null
+    try {
+        const url = new URL(config.resinUrl)
+        url.username = `${config.resinPlatformName}.${accountEmail}`
+        url.password = url.pathname.replace(/^\//, '')
+        url.pathname = ''
+        url.search = ''
+        url.hash = ''
+        return url.toString()
+    } catch {
+        return null
+    }
+}
+
 /**
  * 校验代理 URL 格式
  * 空值（null/undefined/空字符串）视为合法（表示"无账号级代理"）
@@ -25,11 +52,14 @@ const isValidProxyUrl = (url) => {
 
 /**
  * 解析账号实际使用的代理 URL
- * 优先级: account.proxy > 全局 PROXY_URL > 不使用代理
+ * 优先级: Resin（已配置且账号可识别）> account.proxy > 全局 PROXY_URL > 不使用代理
  * @param {Object} [account] - 账号对象（可选）
  * @returns {string|null}
  */
 const resolveProxyUrl = (account) => {
+    // Resin 接入：所有涉及具体账号的网络请求统一走 Resin（最高优先级）
+    const resinUrl = buildResinProxyUrl(account && account.email)
+    if (resinUrl) return resinUrl
     if (account && typeof account.proxy === 'string' && account.proxy.trim()) {
         return account.proxy.trim()
     }
@@ -122,6 +152,8 @@ const applyProxyToFetchOptions = (fetchOptions = {}, account) => {
 }
 
 module.exports = {
+    isResinEnabled,
+    buildResinProxyUrl,
     resolveProxyUrl,
     getProxyAgent,
     invalidateProxyAgent,
