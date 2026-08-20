@@ -208,9 +208,10 @@
                 <div class="relative flex items-center bg-blue-50/80 rounded-lg px-2 py-1">
                   <div class="overflow-x-auto scrollbar-hide flex-1 flex items-center space-x-2">
                     <span class="text-gray-700 min-w-[96px] text-left font-semibold">🌐 Proxy:</span>
-                    <span class="font-medium whitespace-nowrap text-left text-sm" :title="token.proxy || ''">{{ token.proxy || '—' }}</span>
+                    <!-- 展示实际生效的代理（Resin 启用时为 Resin 专属 URL，已掩码令牌）；手工代理保持原样 -->
+                    <span class="font-medium whitespace-nowrap text-left text-sm" :title="token.effectiveProxy || token.proxy || ''">{{ token.effectiveProxy || token.proxy || '—' }}</span>
                   </div>
-                  <button v-if="token.proxy" @click="copyToClipboard(token.proxy)" class="absolute right-2 opacity-0 hover:opacity-100 transition-opacity bg-blue-200 hover:bg-blue-300 rounded px-2 py-1 text-base">📋</button>
+                  <button v-if="token.proxy && !token.effectiveProxyMasked" @click="copyToClipboard(token.proxy)" class="absolute right-2 opacity-0 hover:opacity-100 transition-opacity bg-blue-200 hover:bg-blue-300 rounded px-2 py-1 text-base">📋</button>
                 </div>
               </div>
 

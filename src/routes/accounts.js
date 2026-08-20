@@ -7,7 +7,7 @@ const { JwtDecode } = require('../utils/tools')
 const { adminKeyVerify } = require('../middlewares/authorization')
 const { deleteAccount, saveAccounts, refreshAccountToken } = require('../utils/setting')
 const { parseAccountLine } = require('../utils/account-parser')
-const { isValidProxyUrl } = require('../utils/proxy-helper')
+const { isValidProxyUrl, resolveProxyUrl } = require('../utils/proxy-helper')
 const { DEFAULT_CLI_QUOTA_LIMIT, getAccountCliState } = require('../utils/cli-support')
 
 // 仅在 proxy 字段存在时触发；空字符串/null 一律视为"清除代理"，无需校验
@@ -280,6 +280,22 @@ const ACCOUNT_TOKEN_MASK = '••••••••'
 const maskAccountToken = (token) => (token ? ACCOUNT_TOKEN_MASK : '')
 
 /**
+ * 掩码代理 URL 中的密码。Resin 场景下密码是共享网关令牌，
+ * 不应明文展示在 UI（与 token 掩码同一安全策略）
+ * @param {string} url - 代理 URL
+ * @returns {string} 掩码后的 URL
+ */
+const maskProxyUrl = (url) => {
+    try {
+        const u = new URL(url)
+        if (u.password) u.password = '***'
+        return u.toString()
+    } catch {
+        return url
+    }
+}
+
+/**
  * 获取所有账号（分页）
  *
  * @param {number} page 页码
@@ -301,12 +317,20 @@ router.get('/getAllAccounts', adminKeyVerify, async (req, res) => {
 
     // 获取每个账号的详细信息
     const accounts = paginatedAccounts.map(account => {
+      // 实际生效的代理（Resin 启用时为账号专属 Resin URL；否则为手工代理或全局回退）
+      const effective = resolveProxyUrl(account)
+      const manual = account.proxy ?? null
+      // 仅当实际代理并非手工代理时才掩码（手工代理保持原有展示，含密码也可复制）
+      const isDerived = Boolean(effective && effective !== manual)
+
       return {
         email: account.email,
         password: account.password,
         token: maskAccountToken(account.token),
         expires: account.expires,
-        proxy: account.proxy ?? null
+        proxy: manual,
+        effectiveProxy: isDerived ? maskProxyUrl(effective) : effective,
+        effectiveProxyMasked: isDerived
       }
     })
 
